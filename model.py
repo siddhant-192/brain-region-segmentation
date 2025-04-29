@@ -1,0 +1,555 @@
+########## model.py ##########
+
+import torch
+import torch.nn as nn
+import os
+import numpy as np
+import cv2
+from torch.utils.data import Dataset
+from pathlib import Path
+import torch.nn.functional as F
+from monai.losses import DiceLoss
+from kornia.losses import BinaryFocalLossWithLogits
+import kornia.filters as KF
+import segmentation_models_pytorch as smp
+
+class BrainSegmentationDataset(Dataset):
+    def __init__(self, data_dir, transform=None, img_size=4096):
+        """
+        Dataset for brain segmentation that loads whole images.
+
+        Args:
+            data_dir (str): Directory where the data is stored
+            transform (callable, optional): Transforms to apply to the images and the labels
+            img_size (int): Size to resize the image to (default: 4096)
+        """
+        self.data_dir  = data_dir
+        self.transform = transform
+        self.img_size = img_size
+
+        self.images_dir = os.path.join(data_dir, "images")
+        self.labels_dir = os.path.join(data_dir, "labels")
+
+        self.image_filenames = sorted([f for f in os.listdir(self.images_dir) if f.endswith(('.jpg'))])
+
+        self.class_to_idx = {
+            "Thalamus": 0,
+            "Caudate nucleus": 1,
+            "Putamen": 2,
+            "Globus pallidus": 3,
+            "Nucleus accumbens": 4,
+            "Internal capsule": 5,
+            "Substantia innominata": 6,
+            "Fornix": 7,
+            "Anterior commissure": 8,
+            "Ganglionic eminence": 9,
+            "Hypothalamus": 10,
+            "Amygdala": 11,
+            "Hippocampus": 12,
+            "Choroid plexus": 13,
+            "Lateral ventricle": 14,
+            "Olfactory tubercle": 15,
+            "Pretectum": 16,
+            "Inferior colliculus": 17,
+            "Superior colliculus": 18,
+            "Tegmentum": 19,
+            "Pons": 20,
+            "Medulla": 21,
+            "Cerebellum": 22,
+            "Corpus callosum": 23,
+            "Cerebral cortex": 24
+        }
+
+        self.idx_to_class = {v:k for k,v in self.class_to_idx.items()}
+
+        self.colors = {
+            0:  "#6ff151",  # Thalamus
+            1:  "#65ce0c",  # Caudate nucleus
+            2:  "#d6cb4d",  # Putamen
+            3:  "#e5feba",  # Globus pallidus
+            4:  "#8e6f03",  # Nucleus accumbens
+            5:  "#8e4527",  # Internal capsule
+            6:  "#4f9b02",  # Substantia innominata
+            7:  "#ac561e",  # Fornix
+            8:  "#b7cc25",  # Anterior commissure
+            9:  "#876f47",  # Ganglionic eminence
+            10: "#3fe936",  # Hypothalamus
+            11: "#74af15",  # Amygdala
+            12: "#bd885c",  # Hippocampus
+            13: "#b5e60a",  # Choroid plexus
+            14: "#88b151",  # Lateral ventricle
+            15: "#ecad5e",  # Olfactory tubercle
+            16: "#707166",  # Pretectum
+            17: "#a1830f",  # Inferior colliculus
+            18: "#ff9b3d",  # Superior colliculus
+            19: "#eaeea1",  # Tegmentum
+            20: "#cc7e39",  # Pons
+            21: "#fcae1b",  # Medulla
+            22: "#4e4137",  # Cerebellum
+            23: "#de998d",  # Corpus callosum
+            24: "#50fa0d",  # Cerebral cortex
+        }
+
+    def __len__(self):
+        """
+        Get the number of images (datapoints) present in the dataset
+        """
+        return len(self.image_filenames)
+
+    def __getitem__(self, index):
+        """
+        Get a single whole image and its label.
+        """
+        img_filename = self.image_filenames[index]
+        img_path = os.path.join(self.images_dir, img_filename)
+
+        # Load image
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        original_h, original_w = img.shape[:2]
+
+        # Resize to target size while preserving aspect ratio
+        if (original_h, original_w) != (self.img_size, self.img_size):
+            img = self._resize_preserve_aspect(img, self.img_size)
+        
+        # Parse YOLO format labels
+        label_filename = img_filename.replace(".jpg", ".txt")
+        label_path = os.path.join(self.labels_dir, label_filename)
+
+        segments, classes = self._parse_yolo_labels(label_path, original_w, original_h)
+
+        # Apply any transformation
+        if self.transform:
+            img, segments = self.transform(img, segments)
+        
+        # Convert to tensor
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+        # Create target dict
+        target = {
+            'segments': segments,
+            'cls': torch.tensor(classes, dtype=torch.int64),
+            'original_size': (original_h, original_w)
+        }
+
+        return img_tensor, target
+    
+    def _resize_preserve_aspect(self, img, target_size):
+        """
+        Resize the image preserving ratio with padding.
+        """
+        h, w = img.shape[:2]
+        scale = min(target_size / w, target_size / h)
+        
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h))
+
+        # Create square image with padding
+        square = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+
+        # Center the resized image
+        x_offset = (target_size - new_w) // 2
+        y_offset = (target_size - new_h) // 2
+
+        square[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+
+        return square
+    
+    def _parse_yolo_labels(self, label_path, orig_w, orig_h):
+        """
+        Parse YOLO format labels
+        """
+        segments, classes = [], []
+
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f.read().strip().splitlines():
+                    parts = line.split()
+                    cls = int(parts[0])
+                    coords = list(map(float, parts[1:]))
+
+                    # Convert to absolute coordinates
+                    abs_coords = []
+                    for i in range(0, len(coords), 2):
+                        abs_coords.append(coords[i] * orig_w)
+                        abs_coords.append(coords[i+1] * orig_h)
+                    
+                    segments.append(abs_coords)
+                    classes.append(cls)
+        
+        return segments, classes
+
+class PatchFusionYOLO(nn.Module):
+    def __init__(self, base_model, num_classes=25, learn_fusion_weights=True):
+        super().__init__()
+        self.base_model = base_model
+        self.num_classes = num_classes
+
+        # Image size parameters
+        self.imgsz_4096 = 4096
+        self.imgsz_2048 = 2048
+
+        # Patch parameters
+        self.overlap_percent = 10
+        self.central_patch_overlap = 5
+
+        # Initialize learnable fusion weights if enabled
+        self.learn_fusion_weights = learn_fusion_weights
+        if learn_fusion_weights:
+            # Weights for 5 patches ( 4 quadrants + 1 central)
+            self.patch_weights = nn.Parameter(torch.ones(5) / 5)
+            # Weight for balancing 2048 vs 4096 resolution results
+            self.resolution_weight = nn.Parameter(torch.tensor(0.5))
+            # Weight for boundary regions
+            self.boundary_weight = nn.Parameter(torch.tensor(0.2))
+        else:
+            # Fixed weights
+            self.register_buffer('patch_weights', torch.tensor([1.0, 1.0, 1.0, 1.0, 3.0]))
+            self.register_buffer('resolution_weight', torch.tensor(0.5))
+            self.register_buffer('boundary_weight', torch.tensor(0.2))
+        
+    def forward(self, x):
+        """
+        Processes image using multi-scale patch fusion strategy
+        """
+        batch_size, channels, input_height, input_width = x.shape
+
+        # If batch size is >1 then process each image seperately
+        if batch_size>1:
+            outputs = []
+            for i in range(batch_size):
+                outputs.append(self._process_single_image(x[i:i+1]))
+            result = torch.cat(outputs, dim=0)
+        else:
+            result =  self._process_single_image(x)
+        
+        # Resize the output back to the input dimentions
+        if result.shape[2:] != (input_height, input_width):
+            result = F.interpolate(
+                result,
+                size=(input_height, input_width),
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        return result
+    
+    def _process_single_image(self, x):
+        """
+        Process a single image through multi-scale fusion
+        """
+        # Process at both resolutions
+        fusion_map_2048 = self._process_at_2048(x)
+        fusion_map_4096 = self._process_at_4096(x)
+
+        # Fuse multi-resolution results
+        final_fusion_map = self._fuse_multi_resolution(fusion_map_2048, fusion_map_4096)
+
+        return final_fusion_map
+    
+    def _process_at_4096(self ,x):
+        """
+        Process image at 4096 resolution using sliding windows
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Resize to 4096 id needed
+        if x.shape[2:] != (self.imgsz_4096, self.imgsz_4096):
+            x = F.interpolate(
+                x,
+                size=(self.imgsz_4096, self.imgsz_4096),
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        batch_size, channels, height, width = x.shape
+
+        # Define sliding windows
+        windows = [
+            (0, 0, width//2, height//2),
+            (width//4, 0, 3*width//4, height//2),
+            (width//2, 0, width, height//2),
+            (0, height//4, width//2, 3*height//4),
+            (width//4, height//4, 3*width//4, 3*height//4),
+            (width//2, height//4, width, 3*height//4),
+            (0, height//2, width//2, height),
+            (width//4, height//2, 3*width//4, height),
+            (width//2, height//2, width, height)
+        ]
+
+        # Sample input the get the output dimentions
+        # Using small tensor to save memory
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, channels, 128, 128, device=x.device)
+            sample_output = self.base_model(dummy_input)
+            output_channels = sample_output.shape[1]
+        
+        # Initialize fusion map
+        fusion_map_global = torch.zeros(batch_size, output_channels, height, width, device=x.device)
+
+        # Process each window
+        for window_idx, (x1, y1, x2, y2) in enumerate(windows):
+            # Extarct window
+            window = x[:, :, y1:y2, x1:x2]
+
+            # Process with 2048 approach
+            processed_window = self._process_at_2048(window)
+
+            # Add to global fusion map
+            fusion_map_global[:, :, y1:y2, x1:x2] += processed_window
+        
+        return fusion_map_global
+    
+    def _process_at_2048(self, x):
+        """
+        Process input at 2048 resolution using the 5 patch startegy
+        """
+        # Resize to 2048 if needed
+        if x.shape[2:] != (self.imgsz_2048, self.imgsz_2048):
+            x = F.interpolate(
+                x,
+                size=(self.imgsz_2048, self.imgsz_2048),
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        batch_size, channels, height, width = x.shape
+
+        # Generate 3 patches ( 4 quadrants + 1 centeral)
+        patches_with_type = self._generate_patch_coords(height, width)
+
+        # Sample output for output dimentions
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, channels, 128, 128, device=x.device)
+            sample_output = self.base_model(dummy_input)
+            output_channels = sample_output.shape[1]
+        
+        # Initialize fusion map
+        fusion_map = torch.zeros(batch_size, output_channels, height, width, device=x.device)
+
+        # Normalize patch weights using softmax for stability
+        patch_weights_norm = F.softmax(self.patch_weights, dim=0)
+
+        for patch_idx, (patch_type, (x1, y1, x2, y2)) in enumerate(patches_with_type):
+            # Extract patch
+            patch = x[:, :, y1:y2, x1:x2]
+
+            # Process with base model
+            processed_patch = self.base_model(patch)
+
+            # Resize if needed
+            if processed_patch.shape[2:] != (y2-y1, x2-x1):
+                processed_patch = F.interpolate(
+                    processed_patch,
+                    size=(y2-y1, x2-x1),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            # get appropriate weight based on the patch
+            weight = patch_weights_norm[4] if patch_type == 'central' else patch_weights_norm[patch_idx]
+
+            # Apply weight and add to fusion map
+            fusion_map[:, :, y1:y2, x1:x2] += processed_patch * weight
+
+        return fusion_map
+    
+    def _fuse_multi_resolution(self, fusion_map_2048, fusion_map_4096):
+        """
+        Fuse results for different resolutions with learnable weights
+        """
+        # Resize 2048 map to match 4096
+        resized_fusion_map_2048 = F.interpolate(
+            fusion_map_2048,
+            size=fusion_map_4096.shape[2:],
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        # Initialize fused map
+        fused_map = torch.zeros_like(fusion_map_4096)
+
+        # Apply sigmoid to resolution weight for stability
+        resolution_weight = torch.sigmoid(self.resolution_weight)
+
+        # Process each class channel
+        for class_idx in range(fusion_map_4096.shape[1]):
+            # Extarct class maps
+            map_4096 = fusion_map_4096[:, class_idx:class_idx+1]
+            map_2048 = resized_fusion_map_2048[:, class_idx:class_idx+1]
+
+            # Create soft boundary mask based on 2048 map
+            mask_2048 = torch.sigmoid((map_2048 - self.boundary_weight) * 10.0)
+
+            # Weighted combination using learnable parameter
+            fused_map[:, class_idx:class_idx+1] = (
+                map_4096 * resolution_weight +
+                map_2048 * (1 - resolution_weight)
+            ) * mask_2048
+        
+        return fused_map
+    
+    def _generate_patch_coords(self, height, width):
+        """
+        Generate the coordinates for the 5 patches
+        """
+        # Calculate overlap in pixels
+        overlap_w = int(width * self.overlap_percent / 100)
+        overlap_h = int(height * self.overlap_percent / 100)
+
+        # Calculate quadrant patch dimentions
+        quad_patch_w = (width // 2) + overlap_w
+        quad_patch_h = (height // 2) + overlap_h
+
+        # Coordinates for quadrant patches
+        top_left_coords = (0, 0, quad_patch_w, quad_patch_h)
+        top_right_coords = (width // 2 - overlap_w, 0, width, quad_patch_h)
+        bottom_left_coords = (0, height // 2 - overlap_h, quad_patch_w, height)
+        bottom_right_coords = (width // 2 - overlap_w, height // 2 - overlap_h, width, height)
+
+        # Calculate central patch dimentions and coordinates
+        central_patch_w = (width // 2) + int(width * (self.central_patch_overlap *2 /10))
+        central_patch_h = (height // 2) + int(height * (self.central_patch_overlap *2 /10))
+        center_x, center_y = width // 2, height // 2
+
+        central_coords = (
+            max(0, center_x - central_patch_w // 2),
+            max(0, center_y - central_patch_h // 2),
+            min(width, center_x + central_patch_w // 2),
+            min(height, center_y + central_patch_h // 2)
+        )
+
+        return [
+            ('quadrant', top_left_coords),
+            ('quadrant', top_right_coords),
+            ('quadrant', bottom_left_coords),
+            ('quadrant', bottom_right_coords),
+            ('central', central_coords)
+        ]
+
+class BrainSegmentationLoss(nn.Module):
+    def __init__(self, num_classes=25, dice_weight=1.0, focal_weight=0.5, boundary_weight=0.3):
+        super().__init__()
+        self.num_classes = num_classes
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.boundary_weight = boundary_weight
+
+        # Combination of losses
+        self.dice_loss = DiceLoss(
+            include_background=True,
+            to_onehot_y=False,
+            sigmoid=True,
+            squared_pred=True,
+            smooth_nr=1.0
+        )
+
+        self.focal_loss = BinaryFocalLossWithLogits(
+            alpha=0.25,
+            gamma=2.0,
+            reduction='mean'
+        )
+    
+    def forward(self, pred, target):
+        """
+        Calculate combined loss
+        
+        Args:
+            pred: Model predictions (B, C, H, W)
+            target: Dictionary with segmentation information
+        """
+        # Convert target segments to mask format
+        gt_masks = self._segments_to_masks(
+            target['segments'],
+            target['cls'],
+            pred.shape[2:],
+            target['original_size']
+
+        )
+        # Calculate dice and focal losses
+        dice = self.dice_loss(pred, gt_masks)
+        focal = self.focal_loss(pred, gt_masks)
+
+        # Calculate boundary loss using Sobel edge detection
+        pred_sigmoid = torch.sigmoid(pred)
+        pred_edges = KF.sobel(pred_sigmoid)
+        target_edges = KF.sobel(gt_masks)
+        boundary = F.mse_loss(pred_edges, target_edges)
+
+        # Combine losses with weighting
+        total_loss = dice * self.dice_weight + focal * self.focal_weight + boundary * self.boundary_weight
+
+        return total_loss
+    
+    def _segments_to_masks(self, segments, classes, output_size, original_size):
+        """
+        Convert polygon segments to binary masks
+        """
+        batch_size = len(segments)
+        masks = torch.zeros(
+            batch_size, self.num_classes, output_size[0], output_size[1],
+            device=segments[0].device if isinstance(segments[0], torch.Tensor) else 'cpu'
+        )
+
+        for b in range(batch_size):
+            for seg, cls in zip(segments[b], classes[b]):
+                # Convert segments to mask using rasterization
+                mask = self._rasterize_polygon(seg, output_size, original_size[b])
+                masks[b, cls] = torch.max(masks[b, cls], mask)
+        
+        return masks
+    
+    def _rasterize_polygon(self, polygon, output_size, original_size):
+        """
+        Rasterize polygon into binary mask
+
+        Args:
+            polygon: List or tensor of polygon coordinates [x1, y1, x2, y2, ...]
+            output_size: Tuple of (height, width) for output mask
+            original_size: Tuple of (height, width) of the original image
+        """
+        output_h, output_w = output_size
+        orig_h, orig_w = original_size
+
+        # Handle empty polygons
+        if isinstance(polygon, torch.Tensor):
+            if polygon.numel() == 0:
+                return torch.zeros((output_h, output_w), dtype=torch.float32)
+        elif not polygon:
+            return torch.zeros((output_h, output_w), dtype=torch.float32)
+        
+        # Determine device and convert to numpy if needed
+        if isinstance(polygon, torch.Tensor):
+            device = polygon.device
+            polygon_np = polygon.detach().cpu().numpy()
+        else:
+            device = 'cpu'
+            polygon_np = np.array(polygon)
+        
+        # Reshape the pairs of x,y coordinates
+        if len(polygon_np) % 2 == 0 and len(polygon_np) >= 6: # at least 3 points
+            points = polygon_np.reshape(-1,2)
+
+            # Scale coordinates to output size
+            scaled_points = points.copy().astype(np.float64)
+            scale_x = output_w / orig_w
+            scale_y = output_h / orig_h
+
+            scaled_points = points.copy()
+            scaled_points[:, 0] *= scale_x
+            scaled_points[:, 1] *= scale_y
+
+            # Convert to integers for OpenCV
+            points_int = scaled_points.astype(np.int32)
+
+            # Create binary mask using OpenCV
+            mask = np.zeros((output_h, output_w), dtype=np.uint8)
+            cv2.fillPoly(mask, [points_int], 1)
+
+            # Convert to tensor
+            mask_tensor = torch.from_numpy(mask).float().to(device)
+
+            return mask_tensor
+        else:
+            # Invalid polygon return empty mask
+            return torch.zeros((output_h, output_w), dtype=torch.float32, device=device)
