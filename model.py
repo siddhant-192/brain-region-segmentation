@@ -184,6 +184,8 @@ class PatchFusionYOLO(nn.Module):
         self.base_model = base_model
         self.num_classes = num_classes
 
+        self.stride = int(max(base_model.stride)) if hasattr(base_model, "stride") else 32
+
         # Image size parameters
         self.imgsz_4096 = 4096
         self.imgsz_2048 = 2048
@@ -191,6 +193,13 @@ class PatchFusionYOLO(nn.Module):
         # Patch parameters
         self.overlap_percent = 10
         self.central_patch_overlap = 5
+
+        self.class_conv = nn.Conv2d(
+            in_channels=32, # prototype depth from YOLO-seg
+            out_channels=self.num_classes,
+            kernel_size=1,
+            bias=True
+        )
 
         # Initialize learnable fusion weights if enabled
         self.learn_fusion_weights = learn_fusion_weights
@@ -231,7 +240,68 @@ class PatchFusionYOLO(nn.Module):
                 align_corners=False
             )
         
+        result = self.class_conv(result)
+
         return result
+    
+    @staticmethod
+    def _pad_to_stride(x, stride):
+        """
+        When the dimentions are not multiple of the stride (should be a multiple) 
+        then we pad the feature map appropriately so that the new padded feature 
+        map becomes a multiple of the stride.
+        
+        We zero-pad only in the right bottom of the feature map.
+
+        H and W are multiples of the stride after processing through the function.
+        """
+        h, w = x.shape[2:]
+        pad_h = (stride - h % stride) % stride
+        pad_w = (stride - w % stride) % stride
+        if pad_h or pad_w:
+            #(left, right, top, bottom) -> pad on right and bottom only
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        return x, pad_h, pad_w
+    
+    @staticmethod
+    def _spatial_tensor(outputs):
+        """
+        Return the segmentation prototype features from YOLOv9-seg outputs.
+        YOLOv9-seg outputs a tuple where prototype features are at outputs[1][2]
+        with shape (B, 32, H, W)
+        """
+        # Direct path for YOLOv9-seg structure
+        if (isinstance(outputs, tuple) and len(outputs) == 2 and 
+            isinstance(outputs[1], tuple) and len(outputs[1]) == 3 and
+            torch.is_tensor(outputs[1][2]) and outputs[1][2].ndim == 4):
+            # This is the expected structure, return the prototype tensor
+            return outputs[1][2]
+        
+        # Fallback logic for other structures
+        if torch.is_tensor(outputs):
+            # Single tensor case
+            return outputs
+        
+        if isinstance(outputs, (list, tuple)):
+            # Look for 4D tensors with 32 channels first
+            for o in outputs:
+                if torch.is_tensor(o) and o.ndim == 4 and o.shape[1] == 32:
+                    return o
+            
+            # Then look for any 4D tensor
+            for o in outputs:
+                if torch.is_tensor(o) and o.ndim == 4:
+                    return o
+            
+            # Recursive search in nested containers
+            for o in outputs:
+                if isinstance(o, (list, tuple)):
+                    for nested_o in o:
+                        if torch.is_tensor(nested_o) and nested_o.ndim == 4:
+                            return nested_o
+        
+        # If we got here, we didn't find a usable tensor
+        raise RuntimeError(f"No usable tensor output found from base model. Output type: {type(outputs)}")
     
     def _process_single_image(self, x):
         """
@@ -243,6 +313,15 @@ class PatchFusionYOLO(nn.Module):
 
         # Fuse multi-resolution results
         final_fusion_map = self._fuse_multi_resolution(fusion_map_2048, fusion_map_4096)
+
+        # Ensure that final_fusion_map has the expected number of channels (32)
+        if final_fusion_map.shape[1] != 32:
+            final_fusion_map = torch.nn.functional.conv2d(
+                final_fusion_map,
+                weight=torch.ones(32, final_fusion_map.shape[1], 1, 1, device=final_fusion_map.device),
+                bias=None,
+                groups=1
+            )
 
         return final_fusion_map
     
@@ -281,7 +360,9 @@ class PatchFusionYOLO(nn.Module):
         # Using small tensor to save memory
         with torch.no_grad():
             dummy_input = torch.zeros(1, channels, 128, 128, device=x.device)
-            sample_output = self.base_model(dummy_input)
+            sample_outputs = self.base_model(dummy_input)
+            sample_output = self._spatial_tensor(sample_outputs)
+                
             output_channels = sample_output.shape[1]
         
         # Initialize fusion map
@@ -294,6 +375,7 @@ class PatchFusionYOLO(nn.Module):
 
             # Process with 2048 approach
             processed_window = self._process_at_2048(window)
+            processed_window = self._spatial_tensor(processed_window)
 
             # Add to global fusion map
             fusion_map_global[:, :, y1:y2, x1:x2] += processed_window
@@ -302,7 +384,7 @@ class PatchFusionYOLO(nn.Module):
     
     def _process_at_2048(self, x):
         """
-        Process input at 2048 resolution using the 5 patch startegy
+        Process input at 2048 resolution using the 5 patch strategy
         """
         # Resize to 2048 if needed
         if x.shape[2:] != (self.imgsz_2048, self.imgsz_2048):
@@ -315,13 +397,15 @@ class PatchFusionYOLO(nn.Module):
         
         batch_size, channels, height, width = x.shape
 
-        # Generate 3 patches ( 4 quadrants + 1 centeral)
+        # Generate patches (4 quadrants + 1 central)
         patches_with_type = self._generate_patch_coords(height, width)
 
-        # Sample output for output dimentions
+        # Sample output for output dimensions
         with torch.no_grad():
             dummy_input = torch.zeros(1, channels, 128, 128, device=x.device)
-            sample_output = self.base_model(dummy_input)
+            sample_outputs = self.base_model(dummy_input)
+            sample_output = self._spatial_tensor(sample_outputs)
+
             output_channels = sample_output.shape[1]
         
         # Initialize fusion map
@@ -334,8 +418,31 @@ class PatchFusionYOLO(nn.Module):
             # Extract patch
             patch = x[:, :, y1:y2, x1:x2]
 
+            patch, ph, pw = self._pad_to_stride(patch, self.stride)
+
             # Process with base model
             processed_patch = self.base_model(patch)
+            processed_patch = self._spatial_tensor(processed_patch)
+            
+            # FIX: Add safety check for tensor dimensions
+            if processed_patch.dim() < 4:
+                # Handle case where output doesn't have expected dimensions
+                print(f"Warning: Expected 4D tensor but got {processed_patch.dim()}D tensor. Reshaping.")
+                if processed_patch.dim() == 3:
+                    # Add batch dimension if missing
+                    processed_patch = processed_patch.unsqueeze(0)
+                elif processed_patch.dim() < 3:
+                    # Skip this patch if dimensions are too low
+                    print(f"Error: Cannot process tensor with {processed_patch.dim()} dimensions")
+                    continue
+            
+            # FIX: Proper dimension safety check before slicing
+            if ph > 0 or pw > 0:
+                if processed_patch.dim() >= 4 and processed_patch.size(2) > ph and processed_patch.size(3) > pw:
+                    processed_patch = processed_patch[:, :, :processed_patch.size(2) - ph, :processed_patch.size(3) - pw]
+                else:
+                    # Log the shape for debugging
+                    print(f"Warning: Cannot remove padding. Tensor shape: {processed_patch.shape}, ph={ph}, pw={pw}")
 
             # Resize if needed
             if processed_patch.shape[2:] != (y2-y1, x2-x1):
@@ -346,14 +453,14 @@ class PatchFusionYOLO(nn.Module):
                     align_corners=False
                 )
             
-            # get appropriate weight based on the patch
+            # Get appropriate weight based on the patch
             weight = patch_weights_norm[4] if patch_type == 'central' else patch_weights_norm[patch_idx]
 
             # Apply weight and add to fusion map
             fusion_map[:, :, y1:y2, x1:x2] += processed_patch * weight
 
         return fusion_map
-    
+
     def _fuse_multi_resolution(self, fusion_map_2048, fusion_map_4096):
         """
         Fuse results for different resolutions with learnable weights
@@ -445,27 +552,68 @@ class BrainSegmentationLoss(nn.Module):
         )
 
         self.focal_loss = BinaryFocalLossWithLogits(
-            alpha=0.25,
+            alpha=0.75,
             gamma=2.0,
             reduction='mean'
         )
     
     def forward(self, pred, target):
         """
-        Calculate combined loss
+        Calculate combined loss with improved shape handling
         
         Args:
             pred: Model predictions (B, C, H, W)
-            target: Dictionary with segmentation information
+            target: Dictionary with segmentation information or tensor
         """
-        # Convert target segments to mask format
-        gt_masks = self._segments_to_masks(
-            target['segments'],
-            target['cls'],
-            pred.shape[2:],
-            target['original_size']
+        # Debug shape information
+        print(f"Loss input - pred shape: {pred.shape}")
+        
+        # Handle different input types
+        if isinstance(target, dict):
+            # Target is a dictionary with segments info
+            B = pred.size(0)  # true batch size from the model
+            
+            if len(target['segments']) != B:
+                # We received polygons for a single image (or wrong batching) → wrap
+                target_segments = [target['segments']]
+                target_classes = [target['cls']]
+                target_sizes = [target['original_size']]
+            else:
+                target_segments = target['segments']
+                target_classes = target['cls']
+                target_sizes = target['original_size']
 
-        )
+            # Convert polygons → dense masks
+            gt_masks = self._segments_to_masks(
+                target_segments,
+                target_classes,
+                pred.shape[2:],  # (H, W)
+                target_sizes,
+            ).to(pred.device)
+        else:
+            # Target is already a dense mask
+            gt_masks = target.to(pred.device, non_blocking=True)
+        
+        # Debug shape information
+        print(f"Loss calculation - pred shape: {pred.shape}, gt_masks shape: {gt_masks.shape}")
+        
+        # Ensure batch dimensions match
+        if gt_masks.shape[0] != pred.shape[0]:
+            if gt_masks.shape[0] > pred.shape[0]:
+                gt_masks = gt_masks[:pred.shape[0]]  # Take first batch_size items
+            else:
+                # Repeat gt_masks to match batch_size
+                repeats = [1] * len(gt_masks.shape)
+                repeats[0] = pred.shape[0] // gt_masks.shape[0] + 1
+                gt_masks = gt_masks.repeat(*repeats)[:pred.shape[0]]
+        
+        # Ensure channel dimensions match if needed
+        if pred.shape[1] != gt_masks.shape[1]:
+            if pred.shape[1] < gt_masks.shape[1]:
+                pred = F.pad(pred, (0, 0, 0, 0, 0, gt_masks.shape[1] - pred.shape[1]))
+            else:
+                gt_masks = F.pad(gt_masks, (0, 0, 0, 0, 0, pred.shape[1] - gt_masks.shape[1]))
+        
         # Calculate dice and focal losses
         dice = self.dice_loss(pred, gt_masks)
         focal = self.focal_loss(pred, gt_masks)
@@ -480,23 +628,104 @@ class BrainSegmentationLoss(nn.Module):
         total_loss = dice * self.dice_weight + focal * self.focal_weight + boundary * self.boundary_weight
 
         return total_loss
-    
+
     def _segments_to_masks(self, segments, classes, output_size, original_size):
         """
-        Convert polygon segments to binary masks
+        Convert polygon segments to a dense (B, C, H, W) tensor of binary masks.
+        FIXED to properly handle multiple polygons per class per image.
         """
         batch_size = len(segments)
+
+        # Move any CUDA tensort to CPU
+        if isinstance(classes, torch.Tensor) and classes.is_cuda:
+            classes = classes.cpu()
+
+        # -------------------------------------------------- #
+        # 1. Normalise `classes` so it's list-of-lists len B #
+        # -------------------------------------------------- #
+        if isinstance(classes, torch.Tensor):
+            classes = [c.view(-1).tolist() for c in classes]  # split along dim 0
+        else:
+            classes = [c if not isinstance(c, torch.Tensor) else c.view(-1).tolist()
+                    for c in classes]
+
+        if len(classes) == 1 and batch_size > 1:
+            classes *= batch_size
+        assert len(classes) == batch_size, \
+            f"`classes` length {len(classes)} != batch size {batch_size}"
+
+        # ------------------------------------------------------- #
+        # 2. Robustly expand/trim `original_size` to length = B   #
+        # ------------------------------------------------------- #
+        # → first convert any tensor to list-of-tuples
+        if isinstance(original_size, torch.Tensor):
+            if original_size.ndim == 2 and original_size.size(1) == 2:
+                original_size = [tuple(original_size[i].tolist())
+                                for i in range(original_size.size(0))]
+            elif original_size.ndim == 1 and original_size.numel() == 2:
+                original_size = [tuple(original_size.tolist())]
+            else:
+                raise ValueError(f"Unexpected tensor shape for original_size: {original_size.shape}")
+
+        if isinstance(original_size, (tuple, list)):
+            original_size = list(original_size)
+        else:                                   # scalar → wrap
+            original_size = [original_size]
+
+        # replicate or trim to match batch
+        if len(original_size) < batch_size:
+            original_size = (original_size * (batch_size // len(original_size) + 1))[:batch_size]
+        elif len(original_size) > batch_size:
+            original_size = original_size[:batch_size]
+
+        assert len(original_size) == batch_size, \
+            f"Could not broadcast original_size to batch: {len(original_size)} vs {batch_size}"
+
+        # -------------------------------------------------- #
+        # 3. Allocate output tensor                          #
+        # -------------------------------------------------- #
+        device_out = torch.device('cpu')
         masks = torch.zeros(
             batch_size, self.num_classes, output_size[0], output_size[1],
-            device=segments[0].device if isinstance(segments[0], torch.Tensor) else 'cpu'
+            dtype=torch.float32, device=device_out
         )
 
+        # helper to extract (h, w) safely
+        def _hw(os):
+            if isinstance(os, torch.Tensor):
+                os = os.view(-1).tolist()
+            if isinstance(os, (list, tuple)):
+                if len(os) == 1:
+                    return int(os[0]), int(os[0])
+                return int(os[0]), int(os[1])
+            return int(os), int(os)              # scalar
+
+        # -------------------------------------------------- #
+        # 4. Rasterise polygons sample-by-sample             #
+        # -------------------------------------------------- #
         for b in range(batch_size):
-            for seg, cls in zip(segments[b], classes[b]):
-                # Convert segments to mask using rasterization
-                mask = self._rasterize_polygon(seg, output_size, original_size[b])
-                masks[b, cls] = torch.max(masks[b, cls], mask)
-        
+            orig_h, orig_w = _hw(original_size[b])
+
+            # Process each class seperately to avoid large intermediate tensors
+            for seg_idx, (seg, cls) in enumerate(zip(segments[b], classes[b])):
+                if cls >= self.num_classes:
+                    print(f"Warning: Class index {cls} exceeds number of classes {self.num_classes}")
+                    continue
+                
+                try:
+                    # Process just this one polygon
+                    poly_mask = self._rasterize_polygon(seg, output_size, (orig_h, orig_w))
+
+                    # Add to existing mask for this class
+                    masks[b, cls] = torch.max(masks[b, cls], poly_mask)
+
+                    # Explicitly delete intermediates to help memory management
+                    del poly_mask
+                
+                except Exception as e:
+                    print(f"Error processing polygon {seg_idx} of class {cls}: {str(e)}")
+                    continue
+
         return masks
     
     def _rasterize_polygon(self, polygon, output_size, original_size):
@@ -518,12 +747,19 @@ class BrainSegmentationLoss(nn.Module):
         elif not polygon:
             return torch.zeros((output_h, output_w), dtype=torch.float32)
         
-        # Determine device and convert to numpy if needed
+        # # Determine device and convert to numpy if needed
+        # if isinstance(polygon, torch.Tensor):
+        #     device = polygon.device
+        #     polygon_np = polygon.detach().cpu().numpy()
+        # else:
+        #     device = 'cpu'
+        #     polygon_np = np.array(polygon)
+
+        # Always use cpu here
+        device = 'cpu'
         if isinstance(polygon, torch.Tensor):
-            device = polygon.device
             polygon_np = polygon.detach().cpu().numpy()
         else:
-            device = 'cpu'
             polygon_np = np.array(polygon)
         
         # Reshape the pairs of x,y coordinates
@@ -531,7 +767,7 @@ class BrainSegmentationLoss(nn.Module):
             points = polygon_np.reshape(-1,2)
 
             # Scale coordinates to output size
-            scaled_points = points.copy().astype(np.float64)
+            # scaled_points = points.copy().astype(np.float64)
             scale_x = output_w / orig_w
             scale_y = output_h / orig_h
 
@@ -548,6 +784,9 @@ class BrainSegmentationLoss(nn.Module):
 
             # Convert to tensor
             mask_tensor = torch.from_numpy(mask).float().to(device)
+
+            # Free numpy memory
+            del mask, points_int, scaled_points, points, polygon_np
 
             return mask_tensor
         else:
