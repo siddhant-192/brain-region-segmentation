@@ -379,6 +379,10 @@ class PatchFusionYOLO(nn.Module):
 
             # Add to global fusion map
             fusion_map_global[:, :, y1:y2, x1:x2] += processed_window
+
+            # Clear memory
+            del window, processed_window
+            torch.cuda.empty_cache()
         
         return fusion_map_global
     
@@ -569,8 +573,24 @@ class BrainSegmentationLoss(nn.Module):
         print(f"Loss input - pred shape: {pred.shape}")
         
         # Handle different input types
-        if isinstance(target, dict):
-            # Target is a dictionary with segments info
+        if isinstance(target, list) and len(target) > 0 and isinstance(target[0], dict):
+            # Target is a list of dictionaries with segments info (new batch format)
+            B = pred.size(0)  # true batch size from the model
+            
+            # Collect segments, classes, and sizes from batch
+            target_segments = [t['segments'] for t in target]
+            target_classes = [t['cls'] for t in target]
+            target_sizes = [t['original_size'] for t in target]
+
+            # Convert polygons → dense masks
+            gt_masks = self._segments_to_masks(
+                target_segments,
+                target_classes,
+                pred.shape[2:],  # (H, W)
+                target_sizes,
+            ).to(pred.device)
+        elif isinstance(target, dict):
+            # Legacy case: Target is a dictionary with segments info
             B = pred.size(0)  # true batch size from the model
             
             if len(target['segments']) != B:
@@ -626,6 +646,7 @@ class BrainSegmentationLoss(nn.Module):
 
         # Combine losses with weighting
         total_loss = dice * self.dice_weight + focal * self.focal_weight + boundary * self.boundary_weight
+        print("BrainSegmentation loss:", dice, focal, boundary)
 
         return total_loss
 
@@ -640,9 +661,7 @@ class BrainSegmentationLoss(nn.Module):
         if isinstance(classes, torch.Tensor) and classes.is_cuda:
             classes = classes.cpu()
 
-        # -------------------------------------------------- #
-        # 1. Normalise `classes` so it's list-of-lists len B #
-        # -------------------------------------------------- #
+        # 1. Normalise `classes` so it's list-of-lists len B
         if isinstance(classes, torch.Tensor):
             classes = [c.view(-1).tolist() for c in classes]  # split along dim 0
         else:
@@ -654,9 +673,7 @@ class BrainSegmentationLoss(nn.Module):
         assert len(classes) == batch_size, \
             f"`classes` length {len(classes)} != batch size {batch_size}"
 
-        # ------------------------------------------------------- #
-        # 2. Robustly expand/trim `original_size` to length = B   #
-        # ------------------------------------------------------- #
+        # 2. Robustly expand/trim `original_size` to length = B
         # → first convert any tensor to list-of-tuples
         if isinstance(original_size, torch.Tensor):
             if original_size.ndim == 2 and original_size.size(1) == 2:
@@ -681,9 +698,7 @@ class BrainSegmentationLoss(nn.Module):
         assert len(original_size) == batch_size, \
             f"Could not broadcast original_size to batch: {len(original_size)} vs {batch_size}"
 
-        # -------------------------------------------------- #
-        # 3. Allocate output tensor                          #
-        # -------------------------------------------------- #
+        # 3. Allocate output tensor
         device_out = torch.device('cpu')
         masks = torch.zeros(
             batch_size, self.num_classes, output_size[0], output_size[1],
@@ -700,9 +715,7 @@ class BrainSegmentationLoss(nn.Module):
                 return int(os[0]), int(os[1])
             return int(os), int(os)              # scalar
 
-        # -------------------------------------------------- #
-        # 4. Rasterise polygons sample-by-sample             #
-        # -------------------------------------------------- #
+        # 4. Rasterise polygons sample-by-sample
         for b in range(batch_size):
             orig_h, orig_w = _hw(original_size[b])
 
@@ -746,14 +759,6 @@ class BrainSegmentationLoss(nn.Module):
                 return torch.zeros((output_h, output_w), dtype=torch.float32)
         elif not polygon:
             return torch.zeros((output_h, output_w), dtype=torch.float32)
-        
-        # # Determine device and convert to numpy if needed
-        # if isinstance(polygon, torch.Tensor):
-        #     device = polygon.device
-        #     polygon_np = polygon.detach().cpu().numpy()
-        # else:
-        #     device = 'cpu'
-        #     polygon_np = np.array(polygon)
 
         # Always use cpu here
         device = 'cpu'

@@ -30,6 +30,7 @@ def ddp_setup():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
+        print("Rank, WOrld zise:", rank, world_size)
         
         # Environment variables to improve stability
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  
@@ -190,8 +191,13 @@ def visualize_prediction(image, pred_mask, gt_mask, class_colors, idx_to_class, 
 
 def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
     """
-    Calculate the segmentation metrics with improved dimension handling
+    Calculate the segmentation metrics aligned with MONAI DiceLoss implementation
+
+    This metic calculation has the same implementation as the BrainSgmentationLoss class for uniformity and consitency.
     """
+    # Ensure inputs are on the same device
+    device = pred_masks.device
+    
     # Print shapes for debugging
     print(f"Debug - pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
     
@@ -205,30 +211,36 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
             repeats[0] = pred_masks.shape[0] // gt_masks.shape[0] + 1
             gt_masks = gt_masks.repeat(*repeats)[:pred_masks.shape[0]]
     
-    pred_binary = (torch.sigmoid(pred_masks) > threshold).float()
-    gt_binary = (gt_masks > threshold).float()
-    
     try:
-        # Calculate Dice coefficient
-        intersection = torch.sum(pred_binary * gt_binary, dim=(2,3))
-        union = torch.sum(pred_binary, dim=(2,3)) + torch.sum(gt_binary, dim=(2,3))
+        # Convert predictions to probabilities using sigmoid (soft dice)
+        pred_prob = torch.sigmoid(pred_masks)
         
-        # Add small value to avoid division by zero
-        dice = (2.0 * intersection) / (union + 1e-6)
+        # Square predictions as in MONAI DiceLoss(squared_pred=True)
+        pred_prob_squared = pred_prob ** 2
         
-        # Calculate IoU (Jaccard)
-        iou = intersection / (union - intersection + 1e-6)
+        # Calculate soft dice coefficient with squared predictions
+        # Following MONAI implementation pattern
+        intersection = torch.sum(pred_prob_squared * gt_masks, dim=(2,3))
+        pred_sum = torch.sum(pred_prob_squared, dim=(2,3))
+        gt_sum = torch.sum(gt_masks, dim=(2,3))
+        
+        # Add smooth_nr=1.0 in numerator as in MONAI implementation
+        dice = (2.0 * intersection + 1.0) / (pred_sum + gt_sum + 1e-6)
+        
+        # Calculate IoU (Jaccard) using the same soft approach
+        iou = intersection / (pred_sum + gt_sum - intersection + 1e-6)
         
         # Average over batch and classes
         mean_dice = dice.mean().item()
         mean_iou = iou.mean().item()
         
-        # Calculate per class metrics
-        class_dice = dice.mean(dim=0).cpu().numpy()
+        # Calculate per class metrics by averaging across the batch dimension
+        per_class_dice = dice.mean(dim=0)  # Shape: [num_classes]
+        class_dice = per_class_dice.cpu().numpy()  # Convert to numpy for easier reporting
         
     except Exception as e:
         print(f"Error in metric calculation: {str(e)}")
-        print(f"pred_binary shape: {pred_binary.shape}, gt_binary shape: {gt_binary.shape}")
+        print(f"pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
         # Return default values on error
         return {
             'mean_dice': 0.0,
@@ -237,10 +249,11 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
         }
     
     return {
-        'mean_dice': mean_dice,
-        'mean_iou': mean_iou,
-        'class_dice': class_dice
+        'mean_dice': mean_dice,  # Soft dice aligned with loss
+        'mean_iou': mean_iou,    # Soft IoU
+        'class_dice': class_dice  # Per-class soft dice
     }
+
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
                     scaler=None, log_interval=10, grad_clip=1.0, mixed_precision=True):
@@ -265,6 +278,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
     model.train()
     total_loss = 0.0
     total_dice = 0.0
+    total_iou = 0.0
     batch_count = 0
 
     start_time = time.time()
@@ -275,9 +289,16 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
     for  batch_idx, (images, targets) in pbar:
         # Move data to device
         images = images.to(device)
-        for k in targets:
-            if isinstance(targets[k], torch.Tensor):
-                targets[k] = targets[k].to(device)
+        
+        # for k in targets:
+        #     if isinstance(targets[k], torch.Tensor):
+        #         targets[k] = targets[k].to(device)
+        
+        # Updated code to handle targets as a list of dictionaries
+        for i in range(len(targets)):
+            for k in targets[i]:
+                if isinstance(targets[i][k], torch.Tensor):
+                    targets[i][k] = targets[i][k].to(device)
         
         # Zero gradients
         optimizer.zero_grad()
@@ -288,17 +309,23 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
                 outputs = model(images)
                 loss = criterion(outputs, targets)
 
+                # Collect segments data from the list of targets
+                target_segments = [t['segments'] for t in targets]
+                target_classes = [t['cls'] for t in targets]
+                target_sizes = [t['original_size'] for t in targets]
+
                 # Generate ground truth masks for metrics
                 gt_masks = criterion._segments_to_masks(
-                    targets['segments'],
-                    targets['cls'],
+                    target_segments,
+                    target_classes,
                     outputs.shape[2:],
-                    targets['original_size']
-                )
+                    target_sizes
+                ).to(device)
 
                 # Calculate metrics
-                metrics = calculate_metrics(outputs.detach().cpu(), gt_masks)
-                total_dice += metrics['mean_dice']
+                metrics = calculate_metrics(outputs, gt_masks)
+                total_dice += metrics['mean_dice'] # Track dice
+                total_iou += metrics['mean_iou'] # Track IoU
             
             # Backward pass with scaling
             scaler.scale(loss).backward()
@@ -316,17 +343,23 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
             outputs = model(images)
             loss = criterion(outputs, targets)
 
+            # Collect segments data from the list of targets
+            target_segments = [t['segments'] for t in targets]
+            target_classes = [t['cls'] for t in targets]
+            target_sizes = [t['original_size'] for t in targets]
+
             # Generate ground truth masks for metrics
             gt_masks = criterion._segments_to_masks(
-                targets['segments'],
-                targets['cls'],
+                target_segments,
+                target_classes,
                 outputs.shape[2:],
-                targets['original_size']   
-            )
+                target_sizes
+            ).to(device)
 
             # Calculate metrics
             metrics = calculate_metrics(outputs, gt_masks)
             total_dice += metrics['mean_dice']
+            total_iou += metrics['mean_iou']
 
             # Backward pass
             loss.backward()
@@ -346,22 +379,24 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
             'dice': f"{metrics['mean_dice']:.4f}",
+            'iou': f"{metrics['mean_iou']:.4f}",
             'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
         })
 
         # Log to wandb
-        if wandb.run is not None and batch_idx % log_interval == 0:
-            wandb.log({
-                'train/batch_loss': loss.item(),
-                'train/batch_dice': metrics['mean_dice'],
-                'train/batch_iou': metrics['mean_iou'],
-                'train/learning_rate': optimizer.param_groups[0]['lr'],
-                'train/batch': epoch * len(train_loader) + batch_idx
-            })
+        # if wandb.run is not None and batch_idx % log_interval == 0:
+        #     wandb.log({
+        #         'train/batch_loss': loss.item(),
+        #         'train/batch_dice': metrics['mean_dice'],
+        #         'train/batch_iou': metrics['mean_iou'],
+        #         'train/learning_rate': optimizer.param_groups[0]['lr'],
+        #         'train/batch': epoch * len(train_loader) + batch_idx
+        #     })
         
     # Calculate average metrics
     avg_loss = total_loss / batch_count
     avg_dice = total_dice / batch_count
+    avg_iou = total_iou / batch_count
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
@@ -369,6 +404,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
     return {
         'loss': avg_loss,
         'dice': avg_dice,
+        'iou': avg_iou,
         'time': elapsed_time
     }
 
@@ -396,7 +432,7 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
-    total_iou = 0.0
+    total_iou = 0.0  # Added IoU tracking
     batch_count = 0
 
     # Dictionary to store per class dice scores
@@ -416,9 +452,11 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 
                 # Move data to device
                 images = images.to(device)
-                for k in targets:
-                    if isinstance(targets[k], torch.Tensor):
-                        targets[k] = targets[k].to(device)
+                # Updated code to handle targets as a list of dictionaries
+                for i in range(len(targets)):
+                    for k in targets[i]:
+                        if isinstance(targets[i][k], torch.Tensor):
+                            targets[i][k] = targets[i][k].to(device)
                 
                 # Forward pass with optional mixed precision
                 if mixed_precision:
@@ -429,18 +467,22 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 
                 print(f"Model output shape: {outputs.shape}")
                 
-                # Generate ground truth masks for loss and metrics ON CPU
-                # Keep targets on GPU since they're small
+                # Collect segments data from the list of targets
+                target_segments = [t['segments'] for t in targets]
+                target_classes = [t['cls'] for t in targets]
+                target_sizes = [t['original_size'] for t in targets]
+
+                # Generate ground truth masks for loss and metrics ON GPU
                 gt_masks = criterion._segments_to_masks(
-                    targets['segments'],
-                    targets['cls'],
+                    target_segments,
+                    target_classes,
                     outputs.shape[2:],
-                    targets['original_size']
-                )  # This returns CPU tensor
+                    target_sizes
+                ).to(device)  # Move gt_masks to GPU if not already
                 
                 print(f"Ground truth mask shape: {gt_masks.shape}")
                 
-                # Ensure batch dimensions match before moving to GPU
+                # Ensure batch dimensions match before calculating metrics
                 if gt_masks.shape[0] != outputs.shape[0]:
                     print(f"Fixing batch dimension mismatch: gt_masks={gt_masks.shape[0]}, outputs={outputs.shape[0]}")
                     
@@ -454,35 +496,20 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                         repeats[0] = outputs.shape[0] // gt_masks.shape[0] + 1
                         gt_masks = gt_masks.repeat(*repeats)[:outputs.shape[0]]
                 
-                # Move a copy to GPU for loss calculation only
-                gt_masks_gpu = gt_masks.to(device, non_blocking=True)
-                
-                # Calculate loss
+                # Calculate loss on GPU
                 if mixed_precision:
                     with torch.cuda.amp.autocast():
-                        loss = criterion(outputs, gt_masks_gpu)
+                        loss = criterion(outputs, gt_masks)
                 else:
-                    loss = criterion(outputs, gt_masks_gpu)
+                    loss = criterion(outputs, gt_masks)
 
-                # Free GPU memory for ground truth masks
-                del gt_masks_gpu
-                torch.cuda.empty_cache()
-                
-                # Calculate metrics on CPU to save GPU memory
-                outputs_cpu = outputs.cpu()
-                
-                # Free more GPU memory
-                if batch_idx < len(val_loader) - 1:  # Keep last batch outputs for visualization
-                    del outputs
-                    torch.cuda.empty_cache()
-                
-                # Calculate metrics on CPU
-                metrics = calculate_metrics(outputs_cpu, gt_masks)
+                # Calculate metrics on GPU (no CPU transfer)
+                metrics = calculate_metrics(outputs, gt_masks)
                 
                 # Update running statistics
                 total_loss += loss.item()
                 total_dice += metrics['mean_dice']
-                total_iou += metrics['mean_iou']
+                total_iou += metrics['mean_iou']  # Track IoU
                 batch_count += 1
                 
                 # Update per class dice scores
@@ -492,10 +519,11 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                     if not np.isnan(metrics['class_dice'][c]):
                         class_dice_scores[c].append(metrics['class_dice'][c])
                 
-                # Update progress bar
+                # Update progress bar with IoU included
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
-                    'dice': f"{metrics['mean_dice']:.4f}"
+                    'dice': f"{metrics['mean_dice']:.4f}",
+                    'iou': f"{metrics['mean_iou']:.4f}"  # Added IoU to progress bar
                 })
 
                 # Save visualization for select batches
@@ -505,14 +533,16 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                             # Ensure index is valid for gt_masks
                             gt_idx = min(i, gt_masks.shape[0] - 1)
                             
-                            # Move images back to CPU for visualization
+                            # Move tensors to CPU only for visualization
                             img_cpu = images[i].cpu()
+                            outputs_cpu = outputs[i].cpu()
+                            gt_masks_cpu = gt_masks[gt_idx].cpu()
                             
                             # Do visualization on CPU
                             visualize_prediction(
                                 img_cpu,
-                                outputs_cpu[i],
-                                gt_masks[gt_idx],
+                                outputs_cpu,
+                                gt_masks_cpu,
                                 class_colors,
                                 idx_to_class,
                                 f"{batch_idx}_{i}",
@@ -520,16 +550,17 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                                 output_dir
                             )
                             
-                            # Clean up
-                            del img_cpu
+                            # Clean up CPU tensors
+                            del img_cpu, outputs_cpu, gt_masks_cpu
                     except Exception as vis_error:
                         print(f"Error visualizing prediction: {str(vis_error)}")
                         traceback.print_exc()
                         continue
                 
                 # Clean up to save memory
-                del outputs_cpu, gt_masks
-                torch.cuda.empty_cache()
+                if batch_idx < len(val_loader) - 1:  # Keep last batch outputs for potential debugging
+                    del outputs, gt_masks
+                    torch.cuda.empty_cache()
                 
             except Exception as e:
                 print(f"Error processing batch {batch_idx} during validation: {str(e)}")
@@ -562,20 +593,20 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
     avg_class_dice = {c: np.mean(scores) for c, scores in class_dice_scores.items() if scores}
 
     # Log validation results
-    if wandb.run is not None:
-        log_dict = {
-            'val/loss': avg_loss,
-            'val/dice': avg_dice,
-            'val/iou': avg_iou,
-            'val/epoch': epoch
-        }
+    # if wandb.run is not None:
+    #     log_dict = {
+    #         'val/loss': avg_loss,
+    #         'val/dice': avg_dice,
+    #         'val/iou': avg_iou,
+    #         'val/epoch': epoch
+    #     }
 
-        # Log per class dice
-        for c, dice in avg_class_dice.items():
-            class_name = idx_to_class.get(c, f"class_{c}")
-            log_dict[f'val/dice_{class_name}'] = dice
+    #     # Log per class dice
+    #     for c, dice in avg_class_dice.items():
+    #         class_name = idx_to_class.get(c, f"class_{c}")
+    #         log_dict[f'val/dice_{class_name}'] = dice
         
-        wandb.log(log_dict)
+    #     wandb.log(log_dict)
     
     return {
         'loss': avg_loss,
@@ -584,17 +615,42 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
         'class_dice': avg_class_dice
     }
 
+def brain_segmentation_collate_fn(batch):
+    """
+    Custom collate function for brain segmentation data with variable-sized segments.
+    
+    Args:
+        batch: A list of tuples (image, target) from the dataset
+    
+    Returns:
+        A tuple of (batched_images, list_of_targets)
+    """
+    images = []
+    targets = []
+    
+    for image, target in batch:
+        images.append(image)
+        targets.append(target)
+    
+    # Stack images into a batch tensor
+    images = torch.stack(images, dim=0)
+    
+    # Keep targets as a list of dictionaries
+    # Do not attempt to collate the segments
+    
+    return images, targets
+
 def main():
     parser = argparse.ArgumentParser(description="Train brain segmentation model with custom training loop")
     parser.add_argument('--data_dir', type=str, required=True, help='Path to data directory')
     parser.add_argument('--output_dir', type=str, default='./output', help='Output directory')
     parser.add_argument('--yolo_weights', type=str, required=True, help='Path to YOLOv9 weights')
-    parser.add_argument('--img_size', type=int, default=1024, help='Image size for training')
+    parser.add_argument('--img_size', type=int, default=4096, help='Image size for training')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--save_every', type=int, default=5, help='Save checkpoint every N epochs')
+    parser.add_argument('--save_every', type=int, default=10, help='Save checkpoint every N epochs')
     parser.add_argument('--mixed_precision', action='store_true', help='Use mixed precision training')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
     parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume from')
@@ -604,9 +660,10 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--skip_validation', action='store_true', help='Skip validation for debugging')
     parser.add_argument('--use_ddp', action='store_true', help='Force using DDP even on single GPU')
-    parser.add_argument('--val_img_size', type=int, default=None, help='Validation image size (default: same as training)')
+    parser.add_argument('--val_img_size', type=int, default=4096, help='Validation image size (default: same as training)')
     parser.add_argument('--val_batch_size', type=int, default=1, help='Validation batch size (default: 1)')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory efficient operations')
+    parser.add_argument('--track_memory', action='store_true', help='Track GPU memory usage during training')
     args = parser.parse_args()
 
     # Create output directory
@@ -638,14 +695,14 @@ def main():
         world_size = 1
         is_main = True
     
-    val_img_size = args.val_img_size if args.val_img_size else args.img_size
-    
     # Create dataset:
     train_dataset = BrainSegmentationDataset(
         data_dir=os.path.join(args.data_dir, "train"),
         transform=get_transforms(is_train=True),
         img_size=args.img_size
     )
+
+    val_img_size = args.val_img_size if args.val_img_size else args.img_size
 
     val_dataset = BrainSegmentationDataset(
         data_dir=os.path.join(args.data_dir, 'val'),
@@ -679,6 +736,7 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=brain_segmentation_collate_fn,
     )
 
     val_loader = DataLoader(
@@ -687,6 +745,7 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        collate_fn=brain_segmentation_collate_fn,
     )
 
     print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
@@ -695,8 +754,8 @@ def main():
     scaler = GradScaler() if args.mixed_precision else None
 
     # Load base YOLO model
-    base_model = YOLO("/storage/siddhant/work_my/yolo_custom_training_loop/trained_yolov9e-seg.pt")
-    print("Loaded base YOLO model: trained_yolov9e-seg.pt")
+    base_model = YOLO(args.yolo_weights)
+    print(f"Loaded base YOLO model: {args.yolo_weights}")
 
     # Create model
     model = PatchFusionYOLO(
@@ -737,7 +796,7 @@ def main():
     if torch.cuda.is_available():
         try:
             from torch_ema import ExponentialMovingAverage
-            ema = ExponentialMovingAverage(model.parameters(), decay=0.9999)
+            ema = ExponentialMovingAverage(model.parameters(), decay=0.9999) # High decay value is a common choice in medical imaging applications where stability and reliability are more important than rapid adaptation to new data.
             print("Using EMA for model parameters.")
         except ImportError:
             print("torch-ema not found, skipping EMA")
@@ -745,6 +804,7 @@ def main():
     # Resume the checkpoint if specified
     start_epoch = 0
     best_dice = 0.0
+    best_iou = 0.0
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"Loading checkpoint: {args.resume}")
@@ -757,6 +817,7 @@ def main():
             if 'ema' in checkpoint and ema is not None:
                 ema.load_state_dict(checkpoint['ema'])
             best_dice = checkpoint.get('best_dice', 0.0)
+            best_iou = checkpoint.get('best_iou', 0.0)
             print(f"Loaded checkpoint from epoch {start_epoch}")
         else:
             print(f"No checkpoint found at {args.resume}")
@@ -769,11 +830,14 @@ def main():
             print(f"\nEpoch {epoch+1}/{args.num_epochs}")
 
             # Set epoch for distributed sampler
-            if use_distributed:
-                train_sampler.set_epoch(epoch)
-
             if isinstance(train_sampler, DistributedSampler):
                 train_sampler.set_epoch(epoch)
+            
+            # Track memory before training if requested
+            if args.track_memory and is_main and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                start_mem = torch.cuda.memory_allocated() / 1e9  # GB
+                print(f"Memory before training: {start_mem:.2f}GB")
 
             # Train for one epoch
             train_metrics = train_one_epoch(
@@ -787,6 +851,12 @@ def main():
                 grad_clip=args.grad_clip,
                 mixed_precision=args.mixed_precision
             )
+
+            # Track memory after training if requested
+            if args.track_memory and is_main and torch.cuda.is_available():
+                current_mem = torch.cuda.memory_allocated() / 1e9  # GB
+                peak_mem = torch.cuda.max_memory_allocated() / 1e9  # GB
+                print(f"Training memory stats - Current: {current_mem:.2f}GB, Peak: {peak_mem:.2f}GB")
 
             # Update EMA parameters
             if ema is not None:
@@ -833,6 +903,13 @@ def main():
                                 idx_to_class=train_dataset.idx_to_class,
                                 class_colors=train_dataset.colors
                             )
+
+                    # Track memory after validation if requested
+                    if args.track_memory and is_main and torch.cuda.is_available():
+                        current_mem = torch.cuda.memory_allocated() / 1e9  # GB
+                        peak_mem = torch.cuda.max_memory_allocated() / 1e9  # GB
+                        print(f"Validation memory stats - Current: {current_mem:.2f}GB, Peak: {peak_mem:.2f}GB")
+                        torch.cuda.reset_peak_memory_stats()  # Reset for next epoch
                 except Exception as e:
                     print(f"Rank {rank}: Error during validation: {str(e)}")
                     traceback.print_exc()
@@ -850,6 +927,7 @@ def main():
                         dist.barrier()  # Synchronize after validation
                     except Exception as e:
                         print(f"Error in barrier after validation: {e}")
+            
             else:
                 print("Skipping validation as requested")
                 val_metrics = {
@@ -891,8 +969,17 @@ def main():
             lr_scheduler.step(val_metrics['loss'])
 
             # Save checkpoint
-            is_best = val_metrics['dice'] > best_dice
+            is_best_dice = val_metrics['dice'] > best_dice
+            is_best_iou = val_metrics['iou'] > best_iou
+            is_best = is_best_dice or is_best_iou  # Save if either metric improves
+
             best_dice = max(val_metrics['dice'], best_dice)
+            best_iou = max(val_metrics['iou'], best_iou)
+
+            # Update print statement
+            if is_best:
+                selection_metric = "Dice" if is_best_dice else "IoU"
+                print(f"New best model found! Best {selection_metric} score: {best_dice:.4f}, Best IoU: {best_iou:.4f}")
 
             # Save checkpoint
             if is_best or (epoch+1) % args.save_every == 0:
@@ -902,6 +989,7 @@ def main():
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': lr_scheduler.state_dict(),
                     'best_dice': best_dice,
+                    'best_iou': best_iou,
                     'val_metrics': val_metrics,
                 }
 
