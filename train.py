@@ -30,7 +30,6 @@ def ddp_setup():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        print("Rank, WOrld zise:", rank, world_size)
         
         # Environment variables to improve stability
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  
@@ -39,7 +38,7 @@ def ddp_setup():
         os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust based on your network interface
         
         # Use a much shorter timeout
-        timeout = datetime.timedelta(seconds=60)  # 60 seconds instead of 600
+        timeout = datetime.timedelta(seconds=600)  # 60 seconds instead of 600
         
         dist.init_process_group(
             backend="nccl", 
@@ -199,7 +198,7 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
     device = pred_masks.device
     
     # Print shapes for debugging
-    print(f"Debug - pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
+    # print(f"Debug - pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
     
     # Ensure batch dimensions match
     if pred_masks.shape[0] != gt_masks.shape[0]:
@@ -231,12 +230,12 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
         iou = intersection / (pred_sum + gt_sum - intersection + 1e-6)
         
         # Average over batch and classes
-        mean_dice = dice.mean().item()
-        mean_iou = iou.mean().item()
+        mean_dice = dice.mean().detach().item()  # Add .detach() before .item() # code changes
+        mean_iou = iou.mean().detach().item()    # Add .detach() before .item() # code changes
         
         # Calculate per class metrics by averaging across the batch dimension
         per_class_dice = dice.mean(dim=0)  # Shape: [num_classes]
-        class_dice = per_class_dice.cpu().numpy()  # Convert to numpy for easier reporting
+        class_dice = per_class_dice.detach().cpu().numpy()  # Add .detach() before .cpu().numpy() # code changes
         
     except Exception as e:
         print(f"Error in metric calculation: {str(e)}")
@@ -253,7 +252,6 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
         'mean_iou': mean_iou,    # Soft IoU
         'class_dice': class_dice  # Per-class soft dice
     }
-
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
                     scaler=None, log_interval=10, grad_clip=1.0, mixed_precision=True):
@@ -465,7 +463,7 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 else:
                     outputs = model(images)
                 
-                print(f"Model output shape: {outputs.shape}")
+                # print(f"Model output shape: {outputs.shape}")
                 
                 # Collect segments data from the list of targets
                 target_segments = [t['segments'] for t in targets]
@@ -480,7 +478,7 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                     target_sizes
                 ).to(device)  # Move gt_masks to GPU if not already
                 
-                print(f"Ground truth mask shape: {gt_masks.shape}")
+                # print(f"Ground truth mask shape: {gt_masks.shape}")
                 
                 # Ensure batch dimensions match before calculating metrics
                 if gt_masks.shape[0] != outputs.shape[0]:
@@ -866,6 +864,14 @@ def main():
             if is_main:
                 print(f"Train loss: {train_metrics['loss']:.4f}, Dice: {train_metrics['dice']:.4f}, "
                     f"Time: {train_metrics['time']:.2f}s")
+            
+            # Initialize val_metrics with safe defaults BEFORE validation
+            val_metrics = {
+                'loss': float('inf'),
+                'dice': 0.0,
+                'iou': 0.0,
+                'class_dice': {}
+            }
             
             if not args.skip_validation:
             # Add barriers for synchronization

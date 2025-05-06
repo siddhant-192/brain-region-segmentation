@@ -570,7 +570,7 @@ class BrainSegmentationLoss(nn.Module):
             target: Dictionary with segmentation information or tensor
         """
         # Debug shape information
-        print(f"Loss input - pred shape: {pred.shape}")
+        # print(f"Loss input - pred shape: {pred.shape}")
         
         # Handle different input types
         if isinstance(target, list) and len(target) > 0 and isinstance(target[0], dict):
@@ -615,7 +615,7 @@ class BrainSegmentationLoss(nn.Module):
             gt_masks = target.to(pred.device, non_blocking=True)
         
         # Debug shape information
-        print(f"Loss calculation - pred shape: {pred.shape}, gt_masks shape: {gt_masks.shape}")
+        # print(f"Loss calculation - pred shape: {pred.shape}, gt_masks shape: {gt_masks.shape}")
         
         # Ensure batch dimensions match
         if gt_masks.shape[0] != pred.shape[0]:
