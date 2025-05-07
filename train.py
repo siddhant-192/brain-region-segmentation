@@ -25,31 +25,46 @@ from model import BrainSegmentationDataset, BrainSegmentationLoss, PatchFusionYO
 
 def ddp_setup():
     """
-    Initialize distributed process group with proper error handling
+    Initialize distributed process group with improved settings
     """
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         
-        # Environment variables to improve stability
+        # Better environment variables for NCCL stability
         os.environ['NCCL_BLOCKING_WAIT'] = '1'  
         os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-        os.environ['NCCL_DEBUG'] = 'INFO'
-        os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust based on your network interface
+        os.environ['NCCL_DEBUG'] = 'INFO'  # More detailed logs for debugging
+        os.environ['NCCL_IB_TIMEOUT'] = '30'  # Higher timeout in seconds
+        os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'
         
-        # Use a much shorter timeout
-        timeout = datetime.timedelta(seconds=600)  # 60 seconds instead of 600
+        # Use a longer timeout for initialization
+        timeout = datetime.timedelta(minutes=10)  # 10 mins
         
-        dist.init_process_group(
-            backend="nccl", 
-            rank=rank, 
-            world_size=world_size,
-            timeout=timeout
-        )
-        
+        # Try multiple initialization attempts
+        max_attempts = 1
+        for attempt in range(max_attempts):
+            try:
+                dist.init_process_group(
+                    backend="nccl", 
+                    rank=rank, 
+                    world_size=world_size,
+                    timeout=timeout
+                )
+                break
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    print(f"Init attempt {attempt+1} failed: {e}. Retrying...")
+                    time.sleep(10)  # Wait before retry
+                else:
+                    raise
+
         # Set device
         local_rank = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_rank)
+        
+        # Clear GPU cache
+        torch.cuda.empty_cache()
         
         print(f"Process {rank}/{world_size} using local GPU {local_rank}")
         
@@ -254,156 +269,141 @@ def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
     }
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
-                    scaler=None, log_interval=10, grad_clip=1.0, mixed_precision=True):
+                    scaler=None, log_interval=10, grad_clip=1.0, mixed_precision=True,
+                    gradient_accumulation_steps=1):
     """
-    Train for one epoch.
-
-    Args:
-        mode: The neural network model
-        train_loader: DataLoader for training data
-        optimizer: Optimizer for updating weights
-        criterion: Loss function
-        device: Device to train on
-        epoch: Current epoch number
-        scaler: GradScaler for mixed precision training
-        log_interval: How often to log process
-        grad_clip: Gradient clipping value
-        mixed_precision: Weather to use mixed precision training
-    
-    Returns:
-        dict: Dictionary with the training metrics
+    Train for one epoch with proper gradient accumulation and mixed precision.
     """
     model.train()
     total_loss = 0.0
     total_dice = 0.0
     total_iou = 0.0
     batch_count = 0
-
+    
+    # Clear gradients at the beginning
+    optimizer.zero_grad()
+    
     start_time = time.time()
-
-    # Wrap with tqdm for progress bar
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch} [Train]")
 
-    for  batch_idx, (images, targets) in pbar:
-        # Move data to device
-        images = images.to(device)
-        
-        # for k in targets:
-        #     if isinstance(targets[k], torch.Tensor):
-        #         targets[k] = targets[k].to(device)
-        
-        # Updated code to handle targets as a list of dictionaries
-        for i in range(len(targets)):
-            for k in targets[i]:
-                if isinstance(targets[i][k], torch.Tensor):
-                    targets[i][k] = targets[i][k].to(device)
-        
-        # Zero gradients
-        optimizer.zero_grad()
+    dataloader_timeout = 300  # 5 minutes
 
-        # Forward pass with mixed precision
-        if mixed_precision and scaler is not None:
-            with autocast():
+    for batch_idx, (images, targets) in pbar:
+        try:
+            # Move data to device
+            images = images.to(device)
+            
+            for i in range(len(targets)):
+                for k in targets[i]:
+                    if isinstance(targets[i][k], torch.Tensor):
+                        targets[i][k] = targets[i][k].to(device)
+            
+            # Forward pass with mixed precision
+            if mixed_precision and scaler is not None:
+                with autocast():
+                    outputs = model(images)
+                    # Normalize loss by gradient accumulation steps
+                    loss = criterion(outputs, targets) / gradient_accumulation_steps
+                    
+                    # Calculate metrics (doesn't need normalization)
+                    target_segments = [t['segments'] for t in targets]
+                    target_classes = [t['cls'] for t in targets]
+                    target_sizes = [t['original_size'] for t in targets]
+                    
+                    gt_masks = criterion._segments_to_masks(
+                        target_segments,
+                        target_classes,
+                        outputs.shape[2:],
+                        target_sizes
+                    ).to(device)
+                    
+                    metrics = calculate_metrics(outputs, gt_masks)
+                    total_dice += metrics['mean_dice']
+                    total_iou += metrics['mean_iou']
+                
+                # Backward pass with scaling (accumulate gradients)
+                scaler.scale(loss).backward()
+                
+                # Only update weights after accumulating gradients for specified steps
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    # Now it's time to update - only unscale once right before the clip and step
+                    if grad_clip > 0:
+                        # Unscale gradients once before clipping
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    
+                    # Update weights
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    # Zero gradients after optimizer step
+                    optimizer.zero_grad()
+            else:
+                # Standard precision training
                 outputs = model(images)
-                loss = criterion(outputs, targets)
-
-                # Collect segments data from the list of targets
+                loss = criterion(outputs, targets) / gradient_accumulation_steps
+                
+                # Calculate metrics
                 target_segments = [t['segments'] for t in targets]
                 target_classes = [t['cls'] for t in targets]
                 target_sizes = [t['original_size'] for t in targets]
-
-                # Generate ground truth masks for metrics
+                
                 gt_masks = criterion._segments_to_masks(
                     target_segments,
                     target_classes,
                     outputs.shape[2:],
                     target_sizes
                 ).to(device)
-
-                # Calculate metrics
+                
                 metrics = calculate_metrics(outputs, gt_masks)
-                total_dice += metrics['mean_dice'] # Track dice
-                total_iou += metrics['mean_iou'] # Track IoU
+                total_dice += metrics['mean_dice']
+                total_iou += metrics['mean_iou']
+                
+                # Backward pass (accumulate gradients)
+                loss.backward()
+                
+                # Only update weights after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    # Clip gradients if needed
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    
+                    # Update weights
+                    optimizer.step()
+                    
+                    # Zero gradients after optimizer step
+                    optimizer.zero_grad()
             
-            # Backward pass with scaling
-            scaler.scale(loss).backward()
-
-            # Clip gradients
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # Calculate full loss (not normalized) for reporting
+            full_loss = loss.item() * gradient_accumulation_steps
+            total_loss += full_loss
+            batch_count += 1
             
-            # Update weights with scaling
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Standard precision training
-            outputs = model(images)
-            loss = criterion(outputs, targets)
-
-            # Collect segments data from the list of targets
-            target_segments = [t['segments'] for t in targets]
-            target_classes = [t['cls'] for t in targets]
-            target_sizes = [t['original_size'] for t in targets]
-
-            # Generate ground truth masks for metrics
-            gt_masks = criterion._segments_to_masks(
-                target_segments,
-                target_classes,
-                outputs.shape[2:],
-                target_sizes
-            ).to(device)
-
-            # Calculate metrics
-            metrics = calculate_metrics(outputs, gt_masks)
-            total_dice += metrics['mean_dice']
-            total_iou += metrics['mean_iou']
-
-            # Backward pass
-            loss.backward()
-
-            # Clip gradient
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-            # Update weights
-            optimizer.step()
-        
-        # Update running statistics
-        total_loss += loss.item()
-        batch_count += 1
-
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'dice': f"{metrics['mean_dice']:.4f}",
-            'iou': f"{metrics['mean_iou']:.4f}",
-            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
-        })
-
-        # Log to wandb
-        # if wandb.run is not None and batch_idx % log_interval == 0:
-        #     wandb.log({
-        #         'train/batch_loss': loss.item(),
-        #         'train/batch_dice': metrics['mean_dice'],
-        #         'train/batch_iou': metrics['mean_iou'],
-        #         'train/learning_rate': optimizer.param_groups[0]['lr'],
-        #         'train/batch': epoch * len(train_loader) + batch_idx
-        #     })
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{full_loss:.4f}",
+                'dice': f"{metrics['mean_dice']:.4f}",
+                'iou': f"{metrics['mean_iou']:.4f}",
+                'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+            })
+        except Exception as e:
+            print(f"Error processing batch {batch_idx}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
         
     # Calculate average metrics
     avg_loss = total_loss / batch_count
     avg_dice = total_dice / batch_count
     avg_iou = total_iou / batch_count
-
-    # Calculate elapsed time
-    elapsed_time = time.time() - start_time
-
+    
     return {
         'loss': avg_loss,
         'dice': avg_dice,
         'iou': avg_iou,
-        'time': elapsed_time
+        'time': time.time() - start_time
     }
 
 def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_class, class_colors,
@@ -662,6 +662,9 @@ def main():
     parser.add_argument('--val_batch_size', type=int, default=1, help='Validation batch size (default: 1)')
     parser.add_argument('--memory_efficient', action='store_true', help='Use memory efficient operations')
     parser.add_argument('--track_memory', action='store_true', help='Track GPU memory usage during training')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of updates steps to accumulate before performing a backward/update pass')
+    parser.add_argument('--find_unused_parameters', action='store_true', help='Enable find_unused_parameters in DDP')
+    parser.add_argument('--sync_bn', action='store_true', help='Use synchronized batch normalization')
     args = parser.parse_args()
 
     # Create output directory
@@ -732,7 +735,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size // world_size or 1,
         sampler=train_sampler,
-        num_workers=args.num_workers,
+        num_workers=0, #args.num_workers,
         pin_memory=True,
         collate_fn=brain_segmentation_collate_fn,
     )
@@ -762,8 +765,19 @@ def main():
         learn_fusion_weights=True
     ).to(device)
 
+    # Sync batch norm for better stability in distributed training
+    if args.sync_bn and use_distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
     if use_distributed:
-        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+        model = DDP(
+            model, 
+            device_ids=[rank], 
+            output_device=rank, 
+            find_unused_parameters=args.find_unused_parameters,
+            broadcast_buffers=True,  # Ensure buffers are synced
+            bucket_cap_mb=25         # Smaller bucket size for more stable comms
+        )
 
     # Criterion loss function
     criterion = BrainSegmentationLoss(
@@ -829,7 +843,10 @@ def main():
 
             # Set epoch for distributed sampler
             if isinstance(train_sampler, DistributedSampler):
-                train_sampler.set_epoch(epoch)
+                try:
+                    train_sampler.set_epoch(epoch)
+                except Exception as e:
+                    print(f"Error setting epoch for sampler: {str(e)}")
             
             # Track memory before training if requested
             if args.track_memory and is_main and torch.cuda.is_available():
@@ -945,21 +962,27 @@ def main():
 
             # Broadcast validation metrics to all processes
             if world_size > 1:
-                # Create tensors for basic metrics
-                val_tensor = torch.tensor([val_metrics['loss'], val_metrics['dice'], val_metrics['iou']], 
-                                      dtype=torch.float32, device=device)
-                
-                # Broadcast tensors
-                dist.broadcast(val_tensor, 0)
-                
-                # Update metrics from tensor for non-rank-0 processes
-                if not is_main:
-                    val_metrics['loss'] = val_tensor[0].item()
-                    val_metrics['dice'] = val_tensor[1].item()
-                    val_metrics['iou'] = val_tensor[2].item()
-                
-                # Synchronize
-                dist.barrier()
+                try:
+                    # Use a shorter timeout
+                    timeout_seconds = 60
+                    
+                    # Create smaller tensors for basic metrics
+                    val_tensor = torch.tensor([val_metrics['loss'], val_metrics['dice']], 
+                                        dtype=torch.float32, device=device)
+                    
+                    # Execute broadcast with timeout
+                    req = dist.broadcast(val_tensor, 0, async_op=True)
+                    
+                    # Wait with timeout
+                    start_time = time.time()
+                    while not req.is_completed():
+                        if time.time() - start_time > timeout_seconds:
+                            print(f"Broadcast timeout on rank {rank}")
+                            break
+                        time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"Error in broadcast: {e}")
 
             # Now all ranks can safely access val_metrics
             print(f"Val Loss: {val_metrics['loss']:.4f}, Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
@@ -1024,6 +1047,16 @@ def main():
                                 'best_dice': best_dice,
                             }, best_ema_model_path)
                             print(f"Saved best EMA model to {best_ema_model_path}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+                    torch.cuda.reset_accumulated_memory_stats()
+                print(f"Memory after epoch {epoch+1}: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                
+                # On CUDA OOM, try to recover
+                import gc
+                gc.collect()    
         
         print(f"Training completed. Best validation Dice score: {best_dice:.4f}")
 

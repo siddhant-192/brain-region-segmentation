@@ -12,6 +12,7 @@ from monai.losses import DiceLoss
 from kornia.losses import BinaryFocalLossWithLogits
 import kornia.filters as KF
 import segmentation_models_pytorch as smp
+import traceback
 
 class BrainSegmentationDataset(Dataset):
     def __init__(self, data_dir, transform=None, img_size=4096):
@@ -322,6 +323,8 @@ class PatchFusionYOLO(nn.Module):
                 bias=None,
                 groups=1
             )
+        
+        torch.cuda.empty_cache() 
 
         return final_fusion_map
     
@@ -368,20 +371,28 @@ class PatchFusionYOLO(nn.Module):
         # Initialize fusion map
         fusion_map_global = torch.zeros(batch_size, output_channels, height, width, device=x.device)
 
-        # Process each window
-        for window_idx, (x1, y1, x2, y2) in enumerate(windows):
-            # Extarct window
-            window = x[:, :, y1:y2, x1:x2]
-
-            # Process with 2048 approach
-            processed_window = self._process_at_2048(window)
-            processed_window = self._spatial_tensor(processed_window)
-
-            # Add to global fusion map
-            fusion_map_global[:, :, y1:y2, x1:x2] += processed_window
-
-            # Clear memory
-            del window, processed_window
+        # Instead of processing all windows at once, process them in smaller batches
+        # and free memory after each batch
+        windows_batches = [windows[i:i+3] for i in range(0, len(windows), 3)]
+        
+        for batch_idx, window_batch in enumerate(windows_batches):
+            # Process each window in the batch
+            for window_idx, (x1, y1, x2, y2) in enumerate(window_batch):
+                # Extract window
+                window = x[:, :, y1:y2, x1:x2]
+                
+                # Process window
+                processed_window = self._process_at_2048(window)
+                processed_window = self._spatial_tensor(processed_window)
+                
+                # Add to global fusion map
+                fusion_map_global[:, :, y1:y2, x1:x2] += processed_window
+                
+                # Clear memory immediately
+                del window, processed_window
+                torch.cuda.empty_cache()
+            
+            # Additional explicit memory cleanup after each batch
             torch.cuda.empty_cache()
         
         return fusion_map_global
@@ -646,7 +657,7 @@ class BrainSegmentationLoss(nn.Module):
 
         # Combine losses with weighting
         total_loss = dice * self.dice_weight + focal * self.focal_weight + boundary * self.boundary_weight
-        print("BrainSegmentation loss:", dice, focal, boundary)
+        # print("BrainSegmentation loss:", dice, focal, boundary)
 
         return total_loss
 
