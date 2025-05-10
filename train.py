@@ -1,6 +1,7 @@
 ########## train.py ##########
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,4"
 import time
 import argparse
 import numpy as np
@@ -19,59 +20,58 @@ from torch.utils.data.distributed import DistributedSampler
 import datetime
 import sys
 import traceback
+import torch.nn as nn
 
 # Import the custom model classes
 from model import BrainSegmentationDataset, BrainSegmentationLoss, PatchFusionYOLO
 
 def ddp_setup():
     """
-    Initialize distributed process group with improved settings
-    """
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        
-        # Better environment variables for NCCL stability
-        os.environ['NCCL_BLOCKING_WAIT'] = '1'  
-        os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-        os.environ['NCCL_DEBUG'] = 'INFO'  # More detailed logs for debugging
-        os.environ['NCCL_IB_TIMEOUT'] = '30'  # Higher timeout in seconds
-        os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'
-        
-        # Use a longer timeout for initialization
-        timeout = datetime.timedelta(minutes=10)  # 10 mins
-        
-        # Try multiple initialization attempts
-        max_attempts = 1
-        for attempt in range(max_attempts):
-            try:
-                dist.init_process_group(
-                    backend="nccl", 
-                    rank=rank, 
-                    world_size=world_size,
-                    timeout=timeout
-                )
-                break
-            except Exception as e:
-                if attempt < max_attempts - 1:
-                    print(f"Init attempt {attempt+1} failed: {e}. Retrying...")
-                    time.sleep(10)  # Wait before retry
-                else:
-                    raise
+    Initialize torch.distributed for DDP with tuned NCCL settings.
 
-        # Set device
-        local_rank = rank % torch.cuda.device_count()
-        torch.cuda.set_device(local_rank)
-        
-        # Clear GPU cache
-        torch.cuda.empty_cache()
-        
-        print(f"Process {rank}/{world_size} using local GPU {local_rank}")
-        
-        return rank, world_size
-    else:
-        # Fallback to using single GPU
+    Returns:
+        rank (int), world_size (int)
+    Exits the process if initialization fails.
+    """
+    # Only set these if you're actually running under torchrun or have RANK/WORLD_SIZE
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return 0, 1
+
+    # 1) Tune NCCL via the proper TORCH_NCCL_* vars
+    os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT',        '1')
+    os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('TORCH_NCCL_IB_TIMEOUT',           '2000')
+    # Legacy NCCL vars to be safe (some versions still read them)
+    os.environ.setdefault('NCCL_IB_TIMEOUT',                 '2000')
+    os.environ.setdefault('NCCL_SOCKET_IFNAME',              'eth0')
+    os.environ.setdefault('NCCL_DEBUG',                      'INFO')
+    # Optionally get detailed dist logs
+    os.environ.setdefault('TORCH_DISTRIBUTED_DEBUG',         'INFO')
+
+    rank       = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    # Make NCCL use a longer timeout on the init handshake
+    timeout = datetime.timedelta(minutes=10)
+
+    try:
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+            timeout=timeout
+        )
+    except Exception as e:
+        print(f"[DDP Init Error] Failed to init process group: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Set your GPU for this rank and clear cache
+    local_rank = rank % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+    torch.cuda.empty_cache()
+
+    print(f"[DDP] rank {rank}/{world_size} on GPU {local_rank}, NCCL timeout extended")
+    return rank, world_size
 
 # Setup data augmentation
 def get_transforms(is_train=True):
@@ -272,139 +272,183 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
                     scaler=None, log_interval=10, grad_clip=1.0, mixed_precision=True,
                     gradient_accumulation_steps=1):
     """
-    Train for one epoch with proper gradient accumulation and mixed precision.
+    Train for one epoch with proper gradient accumulation, mixed precision,
+    and narrow exception handling (only for data errors).
     """
     model.train()
     total_loss = 0.0
     total_dice = 0.0
     total_iou = 0.0
     batch_count = 0
-    
-    # Clear gradients at the beginning
+
     optimizer.zero_grad()
-    
     start_time = time.time()
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch} [Train]")
 
-    dataloader_timeout = 300  # 5 minutes
-
     for batch_idx, (images, targets) in pbar:
+        # 1) Move data to device
         try:
-            # Move data to device
-            images = images.to(device)
-            
-            for i in range(len(targets)):
-                for k in targets[i]:
-                    if isinstance(targets[i][k], torch.Tensor):
-                        targets[i][k] = targets[i][k].to(device)
-            
-            # Forward pass with mixed precision
-            if mixed_precision and scaler is not None:
-                with autocast():
-                    outputs = model(images)
-                    # Normalize loss by gradient accumulation steps
-                    loss = criterion(outputs, targets) / gradient_accumulation_steps
-                    
-                    # Calculate metrics (doesn't need normalization)
-                    target_segments = [t['segments'] for t in targets]
-                    target_classes = [t['cls'] for t in targets]
-                    target_sizes = [t['original_size'] for t in targets]
-                    
-                    gt_masks = criterion._segments_to_masks(
-                        target_segments,
-                        target_classes,
-                        outputs.shape[2:],
-                        target_sizes
-                    ).to(device)
-                    
-                    metrics = calculate_metrics(outputs, gt_masks)
-                    total_dice += metrics['mean_dice']
-                    total_iou += metrics['mean_iou']
-                
-                # Backward pass with scaling (accumulate gradients)
-                scaler.scale(loss).backward()
-                
-                # Only update weights after accumulating gradients for specified steps
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                    # Now it's time to update - only unscale once right before the clip and step
-                    if grad_clip > 0:
-                        # Unscale gradients once before clipping
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    
-                    # Update weights
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # Zero gradients after optimizer step
-                    optimizer.zero_grad()
-            else:
-                # Standard precision training
+            images = images.to(device, non_blocking=True)
+            for t in targets:
+                for k, v in t.items():
+                    if isinstance(v, torch.Tensor):
+                        t[k] = v.to(device, non_blocking=True)
+        except RuntimeError as data_err:
+            # Only catch data-transfer/transform errors
+            print(f"[DataError] batch {batch_idx}: {data_err}")
+            torch.cuda.empty_cache()
+            continue
+
+        # 2) Forward + backward WITHOUT catching DDP/NCCL errors
+        if mixed_precision and scaler is not None:
+            with autocast():
                 outputs = model(images)
                 loss = criterion(outputs, targets) / gradient_accumulation_steps
-                
-                # Calculate metrics
-                target_segments = [t['segments'] for t in targets]
-                target_classes = [t['cls'] for t in targets]
-                target_sizes = [t['original_size'] for t in targets]
-                
-                gt_masks = criterion._segments_to_masks(
-                    target_segments,
-                    target_classes,
-                    outputs.shape[2:],
-                    target_sizes
-                ).to(device)
-                
-                metrics = calculate_metrics(outputs, gt_masks)
-                total_dice += metrics['mean_dice']
-                total_iou += metrics['mean_iou']
-                
-                # Backward pass (accumulate gradients)
-                loss.backward()
-                
-                # Only update weights after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                    # Clip gradients if needed
-                    if grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    
-                    # Update weights
-                    optimizer.step()
-                    
-                    # Zero gradients after optimizer step
-                    optimizer.zero_grad()
-            
-            # Calculate full loss (not normalized) for reporting
-            full_loss = loss.item() * gradient_accumulation_steps
-            total_loss += full_loss
-            batch_count += 1
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{full_loss:.4f}",
-                'dice': f"{metrics['mean_dice']:.4f}",
-                'iou': f"{metrics['mean_iou']:.4f}",
-                'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
-            })
-        except Exception as e:
-            print(f"Error processing batch {batch_idx}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
-        
-    # Calculate average metrics
-    avg_loss = total_loss / batch_count
-    avg_dice = total_dice / batch_count
-    avg_iou = total_iou / batch_count
-    
+            scaler.scale(loss).backward()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, targets) / gradient_accumulation_steps
+            loss.backward()
+
+        # 3) Gradient accumulation + optimizer step
+        is_last_batch = (batch_idx + 1) == len(train_loader)
+        if (batch_idx + 1) % gradient_accumulation_steps == 0 or is_last_batch:
+            if grad_clip > 0:
+                if mixed_precision and scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            if mixed_precision and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad()
+
+        # 4) Metrics & logging
+        full_loss = loss.item() * gradient_accumulation_steps
+        total_loss += full_loss
+        batch_count += 1
+
+        # Calculate dice/iou for display (you can inline this if you prefer)
+        with torch.no_grad():
+            # regenerate gt_masks for logging
+            target_segments = [t['segments'] for t in targets]
+            target_classes  = [t['cls']      for t in targets]
+            target_sizes    = [t['original_size'] for t in targets]
+            gt_masks = criterion._segments_to_masks(
+                target_segments, target_classes,
+                outputs.shape[2:], target_sizes
+            ).to(device)
+            metrics = calculate_metrics(outputs, gt_masks)
+            total_dice += metrics['mean_dice']
+            total_iou  += metrics['mean_iou']
+
+        pbar.set_postfix({
+            'loss': f"{full_loss:.4f}",
+            'dice': f"{metrics['mean_dice']:.4f}",
+            'iou':  f"{metrics['mean_iou']:.4f}",
+            'lr':   f"{optimizer.param_groups[0]['lr']:.6f}"
+        })
+
+    avg_loss = total_loss / max(batch_count, 1)
+    avg_dice = total_dice / max(batch_count, 1)
+    avg_iou  = total_iou  / max(batch_count, 1)
+
     return {
         'loss': avg_loss,
         'dice': avg_dice,
         'iou': avg_iou,
         'time': time.time() - start_time
     }
+
+def inspect_masks(image, gt_mask, epoch, batch_idx, img_idx, output_dir, class_colors, idx_to_class):
+    """Save detailed class-by-class mask visualizations"""
+    
+    debug_dir = os.path.join(output_dir, f"debug_epoch_{epoch}")
+    os.makedirs(debug_dir, exist_ok=True)
+    
+    # Convert tensors
+    image_np = image.permute(1, 2, 0).cpu().numpy()
+    gt_mask_np = gt_mask.cpu().numpy() > 0.5
+    
+    # Save original image
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image_np)
+    plt.title("Original Image")
+    plt.axis("off")
+    plt.savefig(os.path.join(debug_dir, f"original_{batch_idx}_{img_idx}.png"))
+    plt.close()
+    
+    # Save full ground truth overlay (standard visualization)
+    overlay = image_np.copy()
+    for class_idx in range(gt_mask_np.shape[0]):
+        if np.any(gt_mask_np[class_idx]):
+            color = np.array([int(class_colors[class_idx][i:i+2], 16) / 255 for i in (1, 3, 5)])
+            mask = gt_mask_np[class_idx]
+            overlay = np.where(
+                np.expand_dims(mask, axis=2),
+                0.7 * color.reshape(1, 1, 3) + 0.3 * overlay,
+                overlay
+            )
+    
+    plt.figure(figsize=(10, 10))
+    plt.imshow(overlay)
+    plt.title("All Classes Ground Truth")
+    plt.axis("off")
+    plt.savefig(os.path.join(debug_dir, f"gt_all_{batch_idx}_{img_idx}.png"))
+    plt.close()
+    
+    # Save individual class masks
+    for class_idx in range(gt_mask_np.shape[0]):
+        if np.any(gt_mask_np[class_idx]):
+            class_name = idx_to_class.get(class_idx, f"class_{class_idx}")
+            mask = gt_mask_np[class_idx]
+            
+            # Create colored mask
+            color = np.array([int(class_colors[class_idx][i:i+2], 16) / 255 for i in (1, 3, 5)])
+            color_mask = np.zeros_like(image_np)
+            color_mask[mask] = color
+            
+            # Create overlay with original image
+            overlay = image_np.copy()
+            overlay = np.where(
+                np.expand_dims(mask, axis=2),
+                0.7 * color.reshape(1, 1, 3) + 0.3 * overlay,
+                overlay
+            )
+            
+            # Plot on a single figure
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(image_np)
+            axes[0].set_title("Original Image")
+            axes[0].axis("off")
+            
+            axes[1].imshow(color_mask)
+            axes[1].set_title(f"Class {class_idx}: {class_name}")
+            axes[1].axis("off")
+            
+            axes[2].imshow(overlay)
+            axes[2].set_title("Overlay")
+            axes[2].axis("off")
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(debug_dir, f"gt_class{class_idx}_{batch_idx}_{img_idx}.png"))
+            plt.close(fig)
+    
+    # Also save mask statistics
+    with open(os.path.join(debug_dir, f"mask_stats_{batch_idx}_{img_idx}.txt"), 'w') as f:
+        f.write(f"Image: batch {batch_idx}, index {img_idx}\n")
+        f.write(f"Total classes: {gt_mask_np.shape[0]}\n")
+        f.write("Classes present:\n")
+        
+        for class_idx in range(gt_mask_np.shape[0]):
+            pixel_count = np.sum(gt_mask_np[class_idx])
+            if pixel_count > 0:
+                class_name = idx_to_class.get(class_idx, f"class_{class_idx}")
+                percentage = 100 * pixel_count / (gt_mask_np.shape[1] * gt_mask_np.shape[2])
+                f.write(f"  Class {class_idx} ({class_name}): {pixel_count} pixels ({percentage:.2f}%)\n")
 
 def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_class, class_colors,
              visualize_every=10, max_visualizations=5, mixed_precision=False):
@@ -477,6 +521,20 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                     outputs.shape[2:],
                     target_sizes
                 ).to(device)  # Move gt_masks to GPU if not already
+
+                # After generating gt_masks in validation
+                if batch_idx < 2:  # Only for first 2 batches
+                    for i in range(min(images.size(0), 2)):
+                        inspect_masks(
+                            images[i], 
+                            gt_masks[min(i, gt_masks.shape[0]-1)], 
+                            epoch, 
+                            batch_idx, 
+                            i, 
+                            output_dir,
+                            class_colors,
+                            idx_to_class
+                        )
                 
                 # print(f"Ground truth mask shape: {gt_masks.shape}")
                 
@@ -497,9 +555,9 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 # Calculate loss on GPU
                 if mixed_precision:
                     with torch.cuda.amp.autocast():
-                        loss = criterion(outputs, gt_masks)
+                        loss = criterion(outputs, targets)
                 else:
-                    loss = criterion(outputs, gt_masks)
+                    loss = criterion(outputs, targets)
 
                 # Calculate metrics on GPU (no CPU transfer)
                 metrics = calculate_metrics(outputs, gt_masks)
@@ -583,9 +641,9 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
         }
             
     # Calculate average metrics
-    avg_loss = total_loss / batch_count
-    avg_dice = total_dice / batch_count
-    avg_iou = total_iou / batch_count
+    avg_loss = total_loss / max(batch_count, 1)
+    avg_dice = total_dice / max(batch_count, 1)
+    avg_iou = total_iou / max(batch_count, 1)
 
     # Calculate average per class dice
     avg_class_dice = {c: np.mean(scores) for c, scores in class_dice_scores.items() if scores}
@@ -637,6 +695,115 @@ def brain_segmentation_collate_fn(batch):
     # Do not attempt to collate the segments
     
     return images, targets
+
+def get_fusion_parameters(model):
+    """
+    Identify fusion-related parameters in the model for separate handling.
+    Returns dictionaries of parameters and their names.
+    """
+    fusion_params = {'names': [], 'params': []}
+    other_params = {'names': [], 'params': []}
+    
+    # Identify fusion parameters by name pattern
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        if any(x in name for x in ['patch_weights', 'resolution_weight', 'boundary_weight']):
+            fusion_params['names'].append(name)
+            fusion_params['params'].append(param)
+        else:
+            other_params['names'].append(name)
+            other_params['params'].append(param)
+    
+    return fusion_params, other_params
+
+class FusionWeightTrainer:
+    """
+    Manages progressive training of fusion weights
+    """
+    def __init__(self, model, optimizer, lr, weight_decay):
+        self.model = model
+        self.base_optimizer = optimizer
+        self.base_lr = lr
+        self.weight_decay = weight_decay
+        self.fusion_params, self.other_params = get_fusion_parameters(model)
+        self.current_epoch = -1
+        
+        # Configuration
+        self.freeze_epochs = 5  # Freeze fusion weights for first 5 epochs
+        self.warmup_epochs = 5  # Gradually warm up learning rate after unfreezing
+        
+        # Initial state - freeze fusion weights
+        self._freeze_fusion_weights()
+        print(f"Initialized FusionWeightTrainer:")
+        print(f"  - Found {len(self.fusion_params['names'])} fusion parameters")
+        print(f"  - Found {len(self.other_params['names'])} other parameters")
+        print(f"  - Fusion weights will be frozen for {self.freeze_epochs} epochs")
+    
+    def _freeze_fusion_weights(self):
+        """Freeze fusion weights"""
+        for param in self.fusion_params['params']:
+            param.requires_grad = False
+    
+    def _unfreeze_fusion_weights(self):
+        """Unfreeze fusion weights"""
+        for param in self.fusion_params['params']:
+            param.requires_grad = True
+    
+    def update(self, epoch):
+        """Update training state based on current epoch"""
+        # Skip if same epoch
+        if epoch == self.current_epoch:
+            return self.base_optimizer
+        
+        self.current_epoch = epoch
+        
+        # Handling different training phases
+        if epoch < self.freeze_epochs:
+            # Phase 1: Frozen fusion weights
+            if epoch == 0:
+                print(f"[Epoch {epoch}] Phase 1: Training with frozen fusion weights")
+            return self.base_optimizer
+            
+        elif epoch == self.freeze_epochs:
+            # Phase 2: Unfreeze fusion weights with low learning rate
+            self._unfreeze_fusion_weights()
+            print(f"[Epoch {epoch}] Phase 2: Unfreezing fusion weights with reduced learning rate")
+            
+            # Create new optimizer with parameter groups
+            param_groups = [
+                {'params': self.other_params['params'], 'lr': self.base_lr, 'weight_decay': self.weight_decay},
+                {'params': self.fusion_params['params'], 'lr': self.base_lr * 0.01, 'weight_decay': 0.0}
+            ]
+            self.base_optimizer = optim.AdamW(param_groups)
+            return self.base_optimizer
+            
+        elif epoch < self.freeze_epochs + self.warmup_epochs:
+            # Phase 3: Gradual warmup of fusion weight learning rate
+            progress = (epoch - self.freeze_epochs) / self.warmup_epochs
+            fusion_lr = self.base_lr * (0.01 + 0.99 * progress)
+            
+            print(f"[Epoch {epoch}] Phase 3: Warming up fusion weights lr to {fusion_lr:.6f}")
+            
+            # Update learning rate
+            for param_group in self.base_optimizer.param_groups:
+                if param_group['params'] == self.fusion_params['params']:
+                    param_group['lr'] = fusion_lr
+            
+            return self.base_optimizer
+            
+        else:
+            # Phase 4: Full training with slightly lower lr for fusion weights
+            if epoch == self.freeze_epochs + self.warmup_epochs:
+                print(f"[Epoch {epoch}] Phase 4: Full training (fusion weights at 0.5x lr)")
+                
+                # Final learning rates
+                for param_group in self.base_optimizer.param_groups:
+                    if param_group['params'] == self.fusion_params['params']:
+                        param_group['lr'] = self.base_lr * 0.5
+            
+            return self.base_optimizer
 
 def main():
     parser = argparse.ArgumentParser(description="Train brain segmentation model with custom training loop")
@@ -735,7 +902,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size // world_size or 1,
         sampler=train_sampler,
-        num_workers=0, #args.num_workers,
+        num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=brain_segmentation_collate_fn,
     )
@@ -775,7 +942,7 @@ def main():
             device_ids=[rank], 
             output_device=rank, 
             find_unused_parameters=args.find_unused_parameters,
-            broadcast_buffers=True,  # Ensure buffers are synced
+            broadcast_buffers=False,  # Ensure buffers are synced
             bucket_cap_mb=25         # Smaller bucket size for more stable comms
         )
 
@@ -787,12 +954,15 @@ def main():
         boundary_weight=0.3
     )
 
-    # Create optimizer
+    # Create base optimizer (will be managed by FusionWeightTrainer)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay
     )
+
+    # Create fusion weight trainer to manage progressive training
+    fusion_trainer = FusionWeightTrainer(model, optimizer, args.lr, args.weight_decay)
 
     # Create learning rate scheduler
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -840,6 +1010,9 @@ def main():
         print(f"Starting training from epoch {start_epoch + 1} to {args.num_epochs}")
         for epoch in range(start_epoch, args.num_epochs):
             print(f"\nEpoch {epoch+1}/{args.num_epochs}")
+
+            # Update optimizer based on progressive training schedule
+            optimizer = fusion_trainer.update(epoch)
 
             # Set epoch for distributed sampler
             if isinstance(train_sampler, DistributedSampler):
@@ -962,39 +1135,50 @@ def main():
 
             # Broadcast validation metrics to all processes
             if world_size > 1:
-                try:
-                    # Use a shorter timeout
-                    timeout_seconds = 60
-                    
-                    # Create smaller tensors for basic metrics
-                    val_tensor = torch.tensor([val_metrics['loss'], val_metrics['dice']], 
-                                        dtype=torch.float32, device=device)
-                    
-                    # Execute broadcast with timeout
-                    req = dist.broadcast(val_tensor, 0, async_op=True)
-                    
-                    # Wait with timeout
-                    start_time = time.time()
-                    while not req.is_completed():
-                        if time.time() - start_time > timeout_seconds:
-                            print(f"Broadcast timeout on rank {rank}")
-                            break
-                        time.sleep(0.1)
-                    
-                except Exception as e:
-                    print(f"Error in broadcast: {e}")
+                # Rank 0 has computed val_metrics. Other ranks have default/stale val_metrics.
+                if is_main: # rank == 0
+                    loss_to_bcast = float(val_metrics.get('loss', float('inf')))
+                    dice_to_bcast = float(val_metrics.get('dice', 0.0))
+                    iou_to_bcast = float(val_metrics.get('iou', 0.0))
+                    metrics_tensor = torch.tensor(
+                        [loss_to_bcast, dice_to_bcast, iou_to_bcast],
+                        dtype=torch.float32, device=device
+                    )
+                else: # Other ranks
+                    metrics_tensor = torch.empty(3, dtype=torch.float32, device=device)
 
-            # Now all ranks can safely access val_metrics
-            print(f"Val Loss: {val_metrics['loss']:.4f}, Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
+                try:
+                    # dist.broadcast has a default timeout, ensure it's long enough if needed
+                    # For ProcessGroupNCCL, timeout is configured during init_process_group
+                    dist.broadcast(metrics_tensor, src=0) 
+                    
+                    # All ranks now have the metrics_tensor from rank 0
+                    # Update local val_metrics for consistent logging/scheduling
+                    val_metrics['loss'] = metrics_tensor[0].item()
+                    val_metrics['dice'] = metrics_tensor[1].item()
+                    val_metrics['iou'] = metrics_tensor[2].item()
+
+                except Exception as e:
+                    print(f"Rank {rank}: Error in broadcasting/receiving validation metrics: {e}")
+                    # If broadcast fails, non-master ranks might have inconsistent metrics.
+                    # Ensure scheduler uses a sensible default on failure for non-master.
+                    if not is_main:
+                         val_metrics['loss'] = float('inf') # Fallback for scheduler
+                         val_metrics['dice'] = 0.0
+                         val_metrics['iou'] = 0.0
             
-            # Print per-class dice scores for validation (only on main process)
-            if is_main and 'class_dice' in val_metrics and val_metrics['class_dice']:
-                print("Per-class Dice scores:")
-                for class_idx, dice in sorted(val_metrics['class_dice'].items()):
-                    class_name = train_dataset.idx_to_class.get(class_idx, f"Unknown_{class_idx}")
-                    print(f"  {class_name}: {dice:.4f}")
-            
-            # Update learning rate scheduler
+            # Now all ranks should have the same val_metrics['loss'], ['dice'], ['iou']
+            if is_main:
+                print(f"Val Loss: {val_metrics['loss']:.4f}, Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
+                if 'class_dice' in val_metrics and val_metrics['class_dice']:
+                    print("Per-class Dice scores:")
+                    for class_idx, dice_score in sorted(val_metrics['class_dice'].items()): # Renamed 'dice' to 'dice_score'
+                        class_name = train_dataset.idx_to_class.get(class_idx, f"Unknown_{class_idx}")
+                        print(f"  {class_name}: {dice_score:.4f}")
+            elif world_size > 1: # Other ranks can print their received summary to confirm
+                print(f"Rank {rank} received Val Loss: {val_metrics['loss']:.4f}, Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
+
+            # Update learning rate scheduler (all ranks do this with consistent loss)
             lr_scheduler.step(val_metrics['loss'])
 
             # Save checkpoint

@@ -202,20 +202,30 @@ class PatchFusionYOLO(nn.Module):
             bias=True
         )
 
-        # Initialize learnable fusion weights if enabled
+        # Initialize learnable fusion weights with better defaults and constraints
         self.learn_fusion_weights = learn_fusion_weights
         if learn_fusion_weights:
-            # Weights for 5 patches ( 4 quadrants + 1 central)
-            self.patch_weights = nn.Parameter(torch.ones(5) / 5)
-            # Weight for balancing 2048 vs 4096 resolution results
-            self.resolution_weight = nn.Parameter(torch.tensor(0.5))
-            # Weight for boundary regions
+            # Initialize with more weight on the central patch (3x the others)
+            initial_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 3.0])
+            initial_weights = initial_weights / initial_weights.sum()  # Normalize
+            self.patch_weights_logits = nn.Parameter(torch.log(initial_weights / (1 - initial_weights)))
+            
+            # Initialize resolution weight with slight preference for high-res (4096)
+            self.resolution_weight_logit = nn.Parameter(torch.tensor(0.2))  # Sigmoid(0.2) ≈ 0.55
+            
+            # Initialize boundary weight
             self.boundary_weight = nn.Parameter(torch.tensor(0.2))
         else:
             # Fixed weights
-            self.register_buffer('patch_weights', torch.tensor([1.0, 1.0, 1.0, 1.0, 3.0]))
-            self.register_buffer('resolution_weight', torch.tensor(0.5))
+            self.register_buffer('patch_weights', torch.tensor([1.0, 1.0, 1.0, 1.0, 3.0]) / 7.0)
+            self.register_buffer('resolution_weight', torch.tensor(0.55))
             self.register_buffer('boundary_weight', torch.tensor(0.2))
+
+        # Channel projection layers (lazily initialized when needed)
+        self.channel_projections = nn.ModuleDict()
+        
+        # Expected output channels from YOLO backbone
+        self.expected_channels = 32
         
     def forward(self, x):
         """
@@ -243,6 +253,22 @@ class PatchFusionYOLO(nn.Module):
         
         result = self.class_conv(result)
 
+        # Add skip connection from input image
+        if not hasattr(self, 'input_projection'):
+            # Create projecttion for input on first use
+            self.input_projection = nn.Conv2d(
+                in_channels=channels,
+                out_channels=self.num_classes,
+                kernel_size=1,
+                bias=False
+            ).to(x.device)
+            # Initialize with small weights
+            nn.init.xavier_normal_(self.input_projection.weight, gain=0.01)
+        
+        # Create skip connection with small weight
+        skip_connection = self.input_projection(x)
+        result = result + 0.05 * skip_connection
+
         return result
     
     @staticmethod
@@ -264,45 +290,136 @@ class PatchFusionYOLO(nn.Module):
             x = F.pad(x, (0, pad_w, 0, pad_h))
         return x, pad_h, pad_w
     
-    @staticmethod
-    def _spatial_tensor(outputs):
+    def _spatial_tensor(self, outputs):
         """
-        Return the segmentation prototype features from YOLOv9-seg outputs.
+        Return the segmentation prototype features from YOLOv9-seg outputs with improved robustness.
         YOLOv9-seg outputs a tuple where prototype features are at outputs[1][2]
         with shape (B, 32, H, W)
         """
-        # Direct path for YOLOv9-seg structure
-        if (isinstance(outputs, tuple) and len(outputs) == 2 and 
-            isinstance(outputs[1], tuple) and len(outputs[1]) == 3 and
-            torch.is_tensor(outputs[1][2]) and outputs[1][2].ndim == 4):
-            # This is the expected structure, return the prototype tensor
-            return outputs[1][2]
+        # Initialize tracking variable if not already present
+        if not hasattr(self, '_feature_extracted'):
+            self._feature_extracted = False
         
-        # Fallback logic for other structures
+        # Direct path for YOLOv9-seg structure with better error handling
+        try:
+            if (isinstance(outputs, tuple) and len(outputs) == 2 and 
+                isinstance(outputs[1], tuple) and len(outputs[1]) == 3 and
+                torch.is_tensor(outputs[1][2]) and outputs[1][2].ndim == 4):
+                
+                # This is the expected structure
+                features = outputs[1][2]
+                
+                # Log info on first successful extraction
+                if not self._feature_extracted:
+                    print(f"Successfully extracted YOLOv9-seg prototype features: shape={features.shape}")
+                    self._feature_extracted = True
+                
+                # Validate expected channels
+                if hasattr(self, 'expected_channels') and features.shape[1] != self.expected_channels:
+                    print(f"Warning: Expected {self.expected_channels} channels but got {features.shape[1]}")
+                
+                return features
+        except (IndexError, AttributeError) as e:
+            print(f"Primary feature extraction path failed: {str(e)}")
+        
+        # Fallback logic for other structures with better error messages
         if torch.is_tensor(outputs):
             # Single tensor case
-            return outputs
+            features = outputs
+            if not self._feature_extracted:
+                print(f"Using direct tensor output: shape={features.shape}")
+                self._feature_extracted = True
+            return features
         
         if isinstance(outputs, (list, tuple)):
-            # Look for 4D tensors with 32 channels first
-            for o in outputs:
-                if torch.is_tensor(o) and o.ndim == 4 and o.shape[1] == 32:
+            # First, look for 4D tensors with expected channels
+            expected_channels = getattr(self, 'expected_channels', 32)
+            
+            for i, o in enumerate(outputs):
+                if torch.is_tensor(o) and o.ndim == 4 and o.shape[1] == expected_channels:
+                    if not self._feature_extracted:
+                        print(f"Found tensor with expected channels at outputs[{i}]: shape={o.shape}")
+                        self._feature_extracted = True
                     return o
             
             # Then look for any 4D tensor
-            for o in outputs:
+            for i, o in enumerate(outputs):
                 if torch.is_tensor(o) and o.ndim == 4:
+                    if not self._feature_extracted:
+                        print(f"Found 4D tensor at outputs[{i}]: shape={o.shape}")
+                        self._feature_extracted = True
                     return o
             
-            # Recursive search in nested containers
-            for o in outputs:
+            # Recursive search in nested containers with position tracking
+            for i, o in enumerate(outputs):
                 if isinstance(o, (list, tuple)):
-                    for nested_o in o:
+                    for j, nested_o in enumerate(o):
                         if torch.is_tensor(nested_o) and nested_o.ndim == 4:
+                            if not self._feature_extracted:
+                                print(f"Found nested tensor at outputs[{i}][{j}]: shape={nested_o.shape}")
+                                self._feature_extracted = True
                             return nested_o
         
         # If we got here, we didn't find a usable tensor
-        raise RuntimeError(f"No usable tensor output found from base model. Output type: {type(outputs)}")
+        structure_info = self._describe_structure(outputs)
+        raise RuntimeError(f"No usable tensor found in outputs. Structure: {structure_info}")
+
+    def _describe_structure(self, obj, max_depth=3, current_depth=0):
+        """Helper to describe the structure of complex nested outputs for debugging"""
+        if current_depth >= max_depth:
+            return "..."
+        
+        if torch.is_tensor(obj):
+            return f"Tensor(shape={list(obj.shape)})"
+        
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 0:
+                return "Empty sequence"
+            
+            items = []
+            for i, item in enumerate(obj):
+                if i >= 3:  # Limit to first 3 items
+                    items.append("...")
+                    break
+                items.append(self._describe_structure(item, max_depth, current_depth + 1))
+            
+            container_type = "list" if isinstance(obj, list) else "tuple"
+            return f"{container_type}[{len(obj)}]({', '.join(items)})"
+        
+        return str(type(obj).__name__)
+
+    def _ensure_channel_count(self, tensor, target_channels=None):
+        """
+        Properly map input channels to target channel count using learned projection
+        """
+        if target_channels is None:
+            target_channels = self.expected_channels
+            
+        in_channels = tensor.shape[1]
+        
+        # If channels already match, return as is
+        if in_channels == target_channels:
+            return tensor
+            
+        # Create a unique key for this channel transformation
+        key = f"in{in_channels}_out{target_channels}"
+        
+        # Create projection layer if it doesn't exist
+        if key not in self.channel_projections:
+            self.channel_projections[key] = nn.Conv2d(
+                in_channels, 
+                target_channels,
+                kernel_size=1,
+                bias=False
+            )
+            # Initialize with Kaiming initialization
+            nn.init.kaiming_normal_(self.channel_projections[key].weight)
+            
+            # Move to same device
+            self.channel_projections[key] = self.channel_projections[key].to(tensor.device)
+        
+        # Apply projection
+        return self.channel_projections[key](tensor)
     
     def _process_single_image(self, x):
         """
@@ -316,13 +433,7 @@ class PatchFusionYOLO(nn.Module):
         final_fusion_map = self._fuse_multi_resolution(fusion_map_2048, fusion_map_4096)
 
         # Ensure that final_fusion_map has the expected number of channels (32)
-        if final_fusion_map.shape[1] != 32:
-            final_fusion_map = torch.nn.functional.conv2d(
-                final_fusion_map,
-                weight=torch.ones(32, final_fusion_map.shape[1], 1, 1, device=final_fusion_map.device),
-                bias=None,
-                groups=1
-            )
+        final_fusion_map = self._ensure_channel_count(final_fusion_map)
         
         torch.cuda.empty_cache() 
 
@@ -427,7 +538,10 @@ class PatchFusionYOLO(nn.Module):
         fusion_map = torch.zeros(batch_size, output_channels, height, width, device=x.device)
 
         # Normalize patch weights using softmax for stability
-        patch_weights_norm = F.softmax(self.patch_weights, dim=0)
+        if self.learn_fusion_weights:
+            patch_weights_norm = F.softmax(self.patch_weights_logits, dim=0)
+        else:
+            patch_weights_norm = self.patch_weights
 
         for patch_idx, (patch_type, (x1, y1, x2, y2)) in enumerate(patches_with_type):
             # Extract patch
@@ -471,6 +585,9 @@ class PatchFusionYOLO(nn.Module):
             # Get appropriate weight based on the patch
             weight = patch_weights_norm[4] if patch_type == 'central' else patch_weights_norm[patch_idx]
 
+            # Normalize feature maps before fusion
+            processed_patch = F.normalize(processed_patch, p=2, dim=1)
+
             # Apply weight and add to fusion map
             fusion_map[:, :, y1:y2, x1:x2] += processed_patch * weight
 
@@ -492,7 +609,10 @@ class PatchFusionYOLO(nn.Module):
         fused_map = torch.zeros_like(fusion_map_4096)
 
         # Apply sigmoid to resolution weight for stability
-        resolution_weight = torch.sigmoid(self.resolution_weight)
+        if self.learn_fusion_weights:
+            resolution_weight = torch.sigmoid(self.resolution_weight_logit)
+        else:
+            resolution_weight = self.resolution_weight
 
         # Process each class channel
         for class_idx in range(fusion_map_4096.shape[1]):
@@ -559,7 +679,7 @@ class BrainSegmentationLoss(nn.Module):
 
         # Combination of losses
         self.dice_loss = DiceLoss(
-            include_background=True,
+            include_background=False,
             to_onehot_y=False,
             sigmoid=True,
             squared_pred=True,
@@ -782,14 +902,22 @@ class BrainSegmentationLoss(nn.Module):
         if len(polygon_np) % 2 == 0 and len(polygon_np) >= 6: # at least 3 points
             points = polygon_np.reshape(-1,2)
 
-            # Scale coordinates to output size
-            # scaled_points = points.copy().astype(np.float64)
-            scale_x = output_w / orig_w
-            scale_y = output_h / orig_h
+            # Calculate the SAME scale factor used in _resize_preserve_aspect
+            scale = min(output_w / orig_w, output_h / orig_h)
+            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
 
+            # Calculate the padding offset (match _resize_preserve_aspect logic)
+            x_offset = (output_w - new_w) // 2
+            y_offset = (output_h - new_h) // 2
+
+            # Scale point first
             scaled_points = points.copy()
-            scaled_points[:, 0] *= scale_x
-            scaled_points[:, 1] *= scale_y
+            scaled_points[:, 0] *= scale
+            scaled_points[:, 1] *= scale
+
+            # Then add the offset for the padding
+            scaled_points[:, 0] += x_offset
+            scaled_points[:, 1] += y_offset
 
             # Convert to integers for OpenCV
             points_int = scaled_points.astype(np.int32)
