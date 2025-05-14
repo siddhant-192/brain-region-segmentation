@@ -1,7 +1,7 @@
 ########## train.py ##########
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 import time
 import argparse
 import numpy as np
