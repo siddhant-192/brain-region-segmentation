@@ -1,7 +1,7 @@
 ########## train.py ##########
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5,6,7"
 import time
 import argparse
 import numpy as np
@@ -23,7 +23,7 @@ import traceback
 import torch.nn as nn
 
 # Import the custom model classes
-from model import BrainSegmentationDataset, BrainSegmentationLoss, PatchFusionYOLO
+from model import BrainSegmentationDataset, BrainSegmentationLoss, PatchFusionYOLO, segments_to_masks
 
 def ddp_setup():
     """
@@ -205,67 +205,71 @@ def visualize_prediction(image, pred_mask, gt_mask, class_colors, idx_to_class, 
 
 def calculate_metrics(pred_masks, gt_masks, threshold=0.5):
     """
-    Calculate the segmentation metrics aligned with MONAI DiceLoss implementation
+    Calculate binary Dice and IoU, averaged only over ground-truth classes.
 
-    This metic calculation has the same implementation as the BrainSgmentationLoss class for uniformity and consitency.
+    pred_masks: (B, C, H, W) raw logits
+    gt_masks:   (B, C, H, W) one-hot ground truth
     """
-    # Ensure inputs are on the same device
-    device = pred_masks.device
-    
-    # Print shapes for debugging
-    # print(f"Debug - pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
-    
-    # Ensure batch dimensions match
+    # ---- 1) ensure batch‐sizes match ----
     if pred_masks.shape[0] != gt_masks.shape[0]:
         if gt_masks.shape[0] > pred_masks.shape[0]:
-            gt_masks = gt_masks[:pred_masks.shape[0]]
+            gt_masks = gt_masks[: pred_masks.shape[0]]
         else:
-            # Repeat gt_masks to match batch_size (rarely needed)
-            repeats = [1] * len(gt_masks.shape)
-            repeats[0] = pred_masks.shape[0] // gt_masks.shape[0] + 1
-            gt_masks = gt_masks.repeat(*repeats)[:pred_masks.shape[0]]
-    
+            reps = [1] * gt_masks.ndim
+            reps[0] = pred_masks.shape[0] // gt_masks.shape[0] + 1
+            gt_masks = gt_masks.repeat(*reps)[: pred_masks.shape[0]]
+
     try:
-        # Convert predictions to probabilities using sigmoid (soft dice)
+        # ---- 2) get binary predictions ----
         pred_prob = torch.sigmoid(pred_masks)
-        
-        # Square predictions as in MONAI DiceLoss(squared_pred=True)
-        pred_prob_squared = pred_prob ** 2
-        
-        # Calculate soft dice coefficient with squared predictions
-        # Following MONAI implementation pattern
-        intersection = torch.sum(pred_prob_squared * gt_masks, dim=(2,3))
-        pred_sum = torch.sum(pred_prob_squared, dim=(2,3))
-        gt_sum = torch.sum(gt_masks, dim=(2,3))
-        
-        # Add smooth_nr=1.0 in numerator as in MONAI implementation
-        dice = (2.0 * intersection + 1.0) / (pred_sum + gt_sum + 1e-6)
-        
-        # Calculate IoU (Jaccard) using the same soft approach
-        iou = intersection / (pred_sum + gt_sum - intersection + 1e-6)
-        
-        # Average over batch and classes
-        mean_dice = dice.mean().detach().item()  # Add .detach() before .item() # code changes
-        mean_iou = iou.mean().detach().item()    # Add .detach() before .item() # code changes
-        
-        # Calculate per class metrics by averaging across the batch dimension
-        per_class_dice = dice.mean(dim=0)  # Shape: [num_classes]
-        class_dice = per_class_dice.detach().cpu().numpy()  # Add .detach() before .cpu().numpy() # code changes
-        
+        pred_bin  = (pred_prob > threshold).float()
+
+        # ---- 3) compute per‐sample, per‐class intersection & unions ----
+        # Sum over spatial dims (H,W)
+        intersection = torch.sum(pred_bin * gt_masks, dim=(2, 3))
+        pred_sum     = torch.sum(pred_bin,      dim=(2, 3))
+        gt_sum       = torch.sum(gt_masks,      dim=(2, 3))
+
+        # ---- 4) classic Dice & IoU with tiny smooth ----
+        smooth   = 1e-6
+        dice_map = (2.0 * intersection + smooth) / (pred_sum + gt_sum + smooth)
+        iou_map  = intersection / (pred_sum + gt_sum - intersection + smooth)
+
+        # ---- 5) mask out only the classes *present* in the GT ----
+        present = gt_sum > 0  # shape (B, C)
+
+        if present.any():
+            mean_dice = dice_map[present].mean().item()
+            mean_iou  = iou_map [present].mean().item()
+        else:
+            mean_dice = 0.0
+            mean_iou  = 0.0
+
+        # ---- 6) per‐class Dice across the batch (nan if never present) ----
+        B, C = gt_sum.shape
+        class_dice = []
+        for c in range(C):
+            mask_c = present[:, c]
+            if mask_c.any():
+                class_dice.append(dice_map[:, c][mask_c].mean().item())
+            else:
+                class_dice.append(float('nan'))
+        class_dice = np.array(class_dice)
+
     except Exception as e:
-        print(f"Error in metric calculation: {str(e)}")
-        print(f"pred_masks shape: {pred_masks.shape}, gt_masks shape: {gt_masks.shape}")
-        # Return default values on error
+        print(f"[calculate_metrics] error: {e}")
+        # fallback to zeros
+        C = pred_masks.shape[1]
         return {
             'mean_dice': 0.0,
-            'mean_iou': 0.0,
-            'class_dice': np.array([0.0] * pred_masks.shape[1])
+            'mean_iou':  0.0,
+            'class_dice': np.full((C,), 0.0, dtype=float)
         }
-    
+
     return {
-        'mean_dice': mean_dice,  # Soft dice aligned with loss
-        'mean_iou': mean_iou,    # Soft IoU
-        'class_dice': class_dice  # Per-class soft dice
+        'mean_dice':  mean_dice,
+        'mean_iou':   mean_iou,
+        'class_dice': class_dice
     }
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
@@ -347,8 +351,8 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
 
         pbar.set_postfix({
             'loss': f"{full_loss:.4f}",
-            'dice': f"{metrics['mean_dice']:.4f}",
-            'iou':  f"{metrics['mean_iou']:.4f}",
+            'dice': f"{metrics['mean_dice']:.6f}",
+            'iou':  f"{metrics['mean_iou']:.6f}",
             'lr':   f"{optimizer.param_groups[0]['lr']:.6f}"
         })
 
@@ -363,92 +367,101 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch,
         'time': time.time() - start_time
     }
 
-def inspect_masks(image, gt_mask, epoch, batch_idx, img_idx, output_dir, class_colors, idx_to_class):
-    """Save detailed class-by-class mask visualizations"""
-    
+def inspect_masks(
+    image, 
+    segments,         # List[List[float]]
+    classes,          # List[int]
+    original_size,    # Tuple[int,int]
+    epoch, 
+    batch_idx, 
+    img_idx, 
+    output_dir, 
+    class_colors, 
+    idx_to_class
+):
+    """Save combined + per-class GT overlays using the shared segments_to_masks helper."""
     debug_dir = os.path.join(output_dir, f"debug_epoch_{epoch}")
     os.makedirs(debug_dir, exist_ok=True)
-    
-    # Convert tensors
+
+    # 1) to numpy
     image_np = image.permute(1, 2, 0).cpu().numpy()
-    gt_mask_np = gt_mask.cpu().numpy() > 0.5
+    H, W     = image_np.shape[:2]
+
+    # 2) rebuild masks
+    gt = segments_to_masks(
+        [segments],
+        [classes],
+        output_size=(H, W),
+        original_size=[original_size],
+        num_classes=len(class_colors)
+    )[0]                     # → [C,H,W]
+    gt_np = gt.cpu().numpy() > 0.5
+
+    # 3) Combined overlay
+    combined = image_np.copy()
+    for c in range(gt_np.shape[0]):
+        mask = gt_np[c]
+        if mask.any():
+            # convert hex→rgb in [0,1]
+            color = np.array([int(class_colors[c][i:i+2],16) 
+                              for i in (1,3,5)]) / 255.0
+            combined[mask] = 0.7*color + 0.3*combined[mask]
+
+    fig, ax = plt.subplots(1,1,figsize=(6,6))
+    ax.imshow(combined)
+    ax.axis("off")
+    ax.set_title(f"GT Combined e{epoch}_b{batch_idx}_i{img_idx}")
+    fig.savefig(os.path.join(
+        debug_dir,
+        f"gt_combined_e{epoch}_b{batch_idx}_i{img_idx}.png"
+    ))
+    plt.close(fig)
+
+    # 4) Per‐class panels
+    for class_idx in range(gt_np.shape[0]):
+        mask      = gt_np[class_idx]
+        if not mask.any():
+            continue
+        class_name = idx_to_class[class_idx]
+        color = np.array([int(class_colors[class_idx][i:i+2],16) 
+                          for i in (1,3,5)]) / 255.0
+
+        overlay = image_np.copy()
+        overlay[mask] = 0.7*color + 0.3*overlay[mask]
+
+        fig, ax = plt.subplots(1,2,figsize=(8,4))
+        ax[0].imshow(image_np);      ax[0].set_title("Orig")
+        ax[1].imshow(overlay);       ax[1].set_title(f"{class_idx}: {class_name}")
+        for a in ax: a.axis("off")
+
+        fig.savefig(os.path.join(
+            debug_dir,
+            f"gt_c{class_idx}_e{epoch}_b{batch_idx}_i{img_idx}.png"
+        ))
+        plt.close(fig)
+
+# Add this function to check if the model is properly frozen during validation
+def verify_model_frozen(model):
+    """
+    Verify that the base model parameters are indeed frozen.
+    """
+    frozen_params = 0
+    trainable_params = 0
     
-    # Save original image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image_np)
-    plt.title("Original Image")
-    plt.axis("off")
-    plt.savefig(os.path.join(debug_dir, f"original_{batch_idx}_{img_idx}.png"))
-    plt.close()
+    for name, param in model.named_parameters():
+        if 'base_model' in name:
+            if param.requires_grad:
+                print(f"WARNING: Base model parameter is trainable: {name}")
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+        else:
+            if param.requires_grad:
+                trainable_params += param.numel()
     
-    # Save full ground truth overlay (standard visualization)
-    overlay = image_np.copy()
-    for class_idx in range(gt_mask_np.shape[0]):
-        if np.any(gt_mask_np[class_idx]):
-            color = np.array([int(class_colors[class_idx][i:i+2], 16) / 255 for i in (1, 3, 5)])
-            mask = gt_mask_np[class_idx]
-            overlay = np.where(
-                np.expand_dims(mask, axis=2),
-                0.7 * color.reshape(1, 1, 3) + 0.3 * overlay,
-                overlay
-            )
-    
-    plt.figure(figsize=(10, 10))
-    plt.imshow(overlay)
-    plt.title("All Classes Ground Truth")
-    plt.axis("off")
-    plt.savefig(os.path.join(debug_dir, f"gt_all_{batch_idx}_{img_idx}.png"))
-    plt.close()
-    
-    # Save individual class masks
-    for class_idx in range(gt_mask_np.shape[0]):
-        if np.any(gt_mask_np[class_idx]):
-            class_name = idx_to_class.get(class_idx, f"class_{class_idx}")
-            mask = gt_mask_np[class_idx]
-            
-            # Create colored mask
-            color = np.array([int(class_colors[class_idx][i:i+2], 16) / 255 for i in (1, 3, 5)])
-            color_mask = np.zeros_like(image_np)
-            color_mask[mask] = color
-            
-            # Create overlay with original image
-            overlay = image_np.copy()
-            overlay = np.where(
-                np.expand_dims(mask, axis=2),
-                0.7 * color.reshape(1, 1, 3) + 0.3 * overlay,
-                overlay
-            )
-            
-            # Plot on a single figure
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            axes[0].imshow(image_np)
-            axes[0].set_title("Original Image")
-            axes[0].axis("off")
-            
-            axes[1].imshow(color_mask)
-            axes[1].set_title(f"Class {class_idx}: {class_name}")
-            axes[1].axis("off")
-            
-            axes[2].imshow(overlay)
-            axes[2].set_title("Overlay")
-            axes[2].axis("off")
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(debug_dir, f"gt_class{class_idx}_{batch_idx}_{img_idx}.png"))
-            plt.close(fig)
-    
-    # Also save mask statistics
-    with open(os.path.join(debug_dir, f"mask_stats_{batch_idx}_{img_idx}.txt"), 'w') as f:
-        f.write(f"Image: batch {batch_idx}, index {img_idx}\n")
-        f.write(f"Total classes: {gt_mask_np.shape[0]}\n")
-        f.write("Classes present:\n")
-        
-        for class_idx in range(gt_mask_np.shape[0]):
-            pixel_count = np.sum(gt_mask_np[class_idx])
-            if pixel_count > 0:
-                class_name = idx_to_class.get(class_idx, f"class_{class_idx}")
-                percentage = 100 * pixel_count / (gt_mask_np.shape[1] * gt_mask_np.shape[2])
-                f.write(f"  Class {class_idx} ({class_name}): {pixel_count} pixels ({percentage:.2f}%)\n")
+    print(f"Frozen base model parameters: {frozen_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    return frozen_params > 0 and frozen_params > trainable_params
 
 def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_class, class_colors,
              visualize_every=10, max_visualizations=5, mixed_precision=False):
@@ -471,6 +484,13 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
     Returns:
         dict: Dictionary with validation metrics
     """
+
+    # Verify model is properly frozen
+    if hasattr(model, 'module'):  # Handle DDP wrapper
+        verify_model_frozen(model.module)
+    else:
+        verify_model_frozen(model)
+
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
@@ -523,18 +543,27 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 ).to(device)  # Move gt_masks to GPU if not already
 
                 # After generating gt_masks in validation
-                if batch_idx < 2:  # Only for first 2 batches
-                    for i in range(min(images.size(0), 2)):
-                        inspect_masks(
-                            images[i], 
-                            gt_masks[min(i, gt_masks.shape[0]-1)], 
-                            epoch, 
-                            batch_idx, 
-                            i, 
-                            output_dir,
-                            class_colors,
-                            idx_to_class
-                        )
+                if batch_idx % visualize_every == 0 and batch_idx < max_visualizations * visualize_every:
+                    for i in range(min(images.size(0), 3)):
+                        try:
+                            segs    = target_segments[i]
+                            cls_ids = target_classes[i].tolist()   # Tensor → List[int]
+                            orig_sz = target_sizes[i]
+
+                            inspect_masks(
+                                images[i],
+                                segs,
+                                cls_ids,
+                                orig_sz,
+                                epoch,
+                                batch_idx,
+                                i,
+                                output_dir,
+                                class_colors,
+                                idx_to_class
+                            )
+                        except Exception as e:
+                            print(f"[inspect_masks error] batch {batch_idx} img {i}: {e}")
                 
                 # print(f"Ground truth mask shape: {gt_masks.shape}")
                 
@@ -578,14 +607,14 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                 # Update progress bar with IoU included
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
-                    'dice': f"{metrics['mean_dice']:.4f}",
-                    'iou': f"{metrics['mean_iou']:.4f}"  # Added IoU to progress bar
+                    'dice': f"{metrics['mean_dice']:.6f}",
+                    'iou': f"{metrics['mean_iou']:.6f}"  # Added IoU to progress bar
                 })
 
                 # Save visualization for select batches
                 if batch_idx % visualize_every == 0 and batch_idx < max_visualizations * visualize_every:
                     try:
-                        for i in range(min(images.size(0), 2)):  # Visualize max 2 images per batch
+                        for i in range(min(images.size(0), 3)):  # Visualize max 2 images per batch
                             # Ensure index is valid for gt_masks
                             gt_idx = min(i, gt_masks.shape[0] - 1)
                             
@@ -925,12 +954,16 @@ def main():
     base_model = YOLO(args.yolo_weights)
     print(f"Loaded base YOLO model: {args.yolo_weights}")
 
-    # Create model
+    # Create model with frozen base weights
     model = PatchFusionYOLO(
         base_model=base_model.model,
         num_classes=25,
-        learn_fusion_weights=True
+        learn_fusion_weights=True,
+        freeze_base=True  # This will freeze the base model weights
     ).to(device)
+
+    # Print trainable parameter summary
+    model.print_trainable_parameters()
 
     # Sync batch norm for better stability in distributed training
     if args.sync_bn and use_distributed:
@@ -954,9 +987,14 @@ def main():
         boundary_weight=0.3
     )
 
-    # Create base optimizer (will be managed by FusionWeightTrainer)
+    # IMPORTANT: Only create optimizer with trainable parameters
+    # This prevents frozen parameters from being included in the optimizer
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    print(f"Optimizer will track {len(trainable_params)} parameter groups with {sum(p.numel() for p in trainable_params):,} total parameters")
+
+    # Create optimizer with only trainable parameters
     optimizer = optim.AdamW(
-        model.parameters(),
+        trainable_params,  # Only trainable parameters
         lr=args.lr,
         weight_decay=args.weight_decay
     )
@@ -992,7 +1030,46 @@ def main():
             print(f"Loading checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             start_epoch = checkpoint.get('epoch', 0)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # Handle potential 'module.' prefix mismatches when loading weights
+            if args.resume:
+                if os.path.isfile(args.resume):
+                    print(f"Loading checkpoint: {args.resume}")
+                    checkpoint = torch.load(args.resume, map_location=device)
+                    start_epoch = checkpoint.get('epoch', 0)
+                    
+                    # Create a new state dict without prefix issues
+                    state_dict = checkpoint['model_state_dict']
+                    new_state_dict = {}
+                    
+                    for k, v in state_dict.items():
+                        # Handle both cases: adding or removing 'module.' prefix
+                        if k.startswith('module.') and not any(k.startswith('module.module.') for k in state_dict):
+                            # If we're loading a non-DDP model with a DDP model
+                            if isinstance(model, DDP):
+                                new_state_dict[k] = v
+                            else:
+                                new_state_dict[k[7:]] = v  # Remove 'module.' prefix
+                        else:
+                            # If we're loading a DDP model with a non-DDP model
+                            if isinstance(model, DDP) and not k.startswith('module.'):
+                                new_state_dict[f'module.{k}'] = v
+                            else:
+                                new_state_dict[k] = v
+                    
+                    # Load with strict=False to ignore missing/unexpected keys
+                    model.load_state_dict(new_state_dict, strict=False)
+                    
+                    # Continue with the rest of your loading code
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    if 'scheduler_state_dict' in checkpoint:
+                        lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    if 'ema' in checkpoint and ema is not None:
+                        ema.load_state_dict(checkpoint['ema'])
+                    best_dice = checkpoint.get('best_dice', 0.0)
+                    best_iou = checkpoint.get('best_iou', 0.0)
+                    print(f"Loaded checkpoint from epoch {start_epoch}")
+                else:
+                    print(f"No checkpoint found at {args.resume}")
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint:
                 lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

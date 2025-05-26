@@ -13,6 +13,7 @@ from kornia.losses import BinaryFocalLossWithLogits
 import kornia.filters as KF
 import segmentation_models_pytorch as smp
 import traceback
+from typing import Dict, List, Tuple, Union
 
 class BrainSegmentationDataset(Dataset):
     def __init__(self, data_dir, transform=None, img_size=4096):
@@ -180,10 +181,15 @@ class BrainSegmentationDataset(Dataset):
         return segments, classes
 
 class PatchFusionYOLO(nn.Module):
-    def __init__(self, base_model, num_classes=25, learn_fusion_weights=True):
+    def __init__(self, base_model, num_classes=25, learn_fusion_weights=True, freeze_base=True):
         super().__init__()
         self.base_model = base_model
         self.num_classes = num_classes
+        self.freeze_base = freeze_base
+
+        # CRITICAL FIX: Freeze the base model weights
+        if self.freeze_base:
+            self._freeze_base_model()
 
         self.stride = int(max(base_model.stride)) if hasattr(base_model, "stride") else 32
 
@@ -226,6 +232,61 @@ class PatchFusionYOLO(nn.Module):
         
         # Expected output channels from YOLO backbone
         self.expected_channels = 32
+    
+    def _freeze_base_model(self):
+        """
+        Freeze all parameters in the base model to prevent them from being updated during training.
+        This ensures we only train the additional layers on top.
+        """
+        print("Freezing base YOLOv9 model parameters...")
+        frozen_params = 0
+        for name, param in self.base_model.named_parameters():
+            param.requires_grad = False
+            frozen_params += param.numel()
+        
+        print(f"Frozen {frozen_params:,} parameters in base model")
+        
+        # Set base model to eval mode to ensure consistent behavior
+        self.base_model.eval()
+
+    def train(self, mode=True):
+        """
+        Override train method to ensure base model stays in eval mode when frozen.
+        """
+        super().train(mode)
+        if self.freeze_base:
+            self.base_model.eval()
+        return self
+    
+    def get_trainable_parameters(self):
+        """
+        Return only the trainable parameters (not from base model).
+        """
+        trainable_params = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                trainable_params.append((name, param))
+        return trainable_params
+    
+    def print_trainable_parameters(self):
+        """
+        Print summary of trainable vs frozen parameters.
+        """
+        trainable_params = 0
+        frozen_params = 0
+        
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                trainable_params += param.numel()
+                print(f"Trainable: {name} - {param.numel():,} params")
+            else:
+                frozen_params += param.numel()
+        
+        total_params = trainable_params + frozen_params
+        print(f"\nParameter Summary:")
+        print(f"Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        print(f"Frozen: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+        print(f"Total: {total_params:,}")
         
     def forward(self, x):
         """
@@ -780,159 +841,131 @@ class BrainSegmentationLoss(nn.Module):
         # print("BrainSegmentation loss:", dice, focal, boundary)
 
         return total_loss
-
+    
     def _segments_to_masks(self, segments, classes, output_size, original_size):
-        """
-        Convert polygon segments to a dense (B, C, H, W) tensor of binary masks.
-        FIXED to properly handle multiple polygons per class per image.
-        """
-        batch_size = len(segments)
-
-        # Move any CUDA tensort to CPU
-        if isinstance(classes, torch.Tensor) and classes.is_cuda:
-            classes = classes.cpu()
-
-        # 1. Normalise `classes` so it's list-of-lists len B
-        if isinstance(classes, torch.Tensor):
-            classes = [c.view(-1).tolist() for c in classes]  # split along dim 0
-        else:
-            classes = [c if not isinstance(c, torch.Tensor) else c.view(-1).tolist()
-                    for c in classes]
-
-        if len(classes) == 1 and batch_size > 1:
-            classes *= batch_size
-        assert len(classes) == batch_size, \
-            f"`classes` length {len(classes)} != batch size {batch_size}"
-
-        # 2. Robustly expand/trim `original_size` to length = B
-        # → first convert any tensor to list-of-tuples
-        if isinstance(original_size, torch.Tensor):
-            if original_size.ndim == 2 and original_size.size(1) == 2:
-                original_size = [tuple(original_size[i].tolist())
-                                for i in range(original_size.size(0))]
-            elif original_size.ndim == 1 and original_size.numel() == 2:
-                original_size = [tuple(original_size.tolist())]
-            else:
-                raise ValueError(f"Unexpected tensor shape for original_size: {original_size.shape}")
-
-        if isinstance(original_size, (tuple, list)):
-            original_size = list(original_size)
-        else:                                   # scalar → wrap
-            original_size = [original_size]
-
-        # replicate or trim to match batch
-        if len(original_size) < batch_size:
-            original_size = (original_size * (batch_size // len(original_size) + 1))[:batch_size]
-        elif len(original_size) > batch_size:
-            original_size = original_size[:batch_size]
-
-        assert len(original_size) == batch_size, \
-            f"Could not broadcast original_size to batch: {len(original_size)} vs {batch_size}"
-
-        # 3. Allocate output tensor
-        device_out = torch.device('cpu')
-        masks = torch.zeros(
-            batch_size, self.num_classes, output_size[0], output_size[1],
-            dtype=torch.float32, device=device_out
+        # simply forward to our new helper:
+        return segments_to_masks(
+            segments, classes,
+            output_size, original_size,
+            num_classes=self.num_classes
         )
 
-        # helper to extract (h, w) safely
-        def _hw(os):
-            if isinstance(os, torch.Tensor):
-                os = os.view(-1).tolist()
-            if isinstance(os, (list, tuple)):
-                if len(os) == 1:
-                    return int(os[0]), int(os[0])
-                return int(os[0]), int(os[1])
-            return int(os), int(os)              # scalar
-
-        # 4. Rasterise polygons sample-by-sample
-        for b in range(batch_size):
-            orig_h, orig_w = _hw(original_size[b])
-
-            # Process each class seperately to avoid large intermediate tensors
-            for seg_idx, (seg, cls) in enumerate(zip(segments[b], classes[b])):
-                if cls >= self.num_classes:
-                    print(f"Warning: Class index {cls} exceeds number of classes {self.num_classes}")
-                    continue
-                
-                try:
-                    # Process just this one polygon
-                    poly_mask = self._rasterize_polygon(seg, output_size, (orig_h, orig_w))
-
-                    # Add to existing mask for this class
-                    masks[b, cls] = torch.max(masks[b, cls], poly_mask)
-
-                    # Explicitly delete intermediates to help memory management
-                    del poly_mask
-                
-                except Exception as e:
-                    print(f"Error processing polygon {seg_idx} of class {cls}: {str(e)}")
-                    continue
-
-        return masks
     
-    def _rasterize_polygon(self, polygon, output_size, original_size):
-        """
-        Rasterize polygon into binary mask
+def rasterize_polygon(
+    polygon: Union[List[float], torch.Tensor],
+    output_size: Tuple[int,int],
+    original_size: Tuple[int,int],
+) -> torch.Tensor:
+    """
+    Exactly your old BrainSegmentationLoss._rasterize_polygon,
+    but as a free function.
+    """
+    output_h, output_w = output_size
+    orig_h, orig_w   = original_size
 
-        Args:
-            polygon: List or tensor of polygon coordinates [x1, y1, x2, y2, ...]
-            output_size: Tuple of (height, width) for output mask
-            original_size: Tuple of (height, width) of the original image
-        """
-        output_h, output_w = output_size
-        orig_h, orig_w = original_size
-
-        # Handle empty polygons
-        if isinstance(polygon, torch.Tensor):
-            if polygon.numel() == 0:
-                return torch.zeros((output_h, output_w), dtype=torch.float32)
-        elif not polygon:
+    # early exit on empty
+    if isinstance(polygon, torch.Tensor):
+        if polygon.numel() == 0:
             return torch.zeros((output_h, output_w), dtype=torch.float32)
+    elif not polygon:
+        return torch.zeros((output_h, output_w), dtype=torch.float32)
 
-        # Always use cpu here
-        device = 'cpu'
-        if isinstance(polygon, torch.Tensor):
-            polygon_np = polygon.detach().cpu().numpy()
-        else:
-            polygon_np = np.array(polygon)
-        
-        # Reshape the pairs of x,y coordinates
-        if len(polygon_np) % 2 == 0 and len(polygon_np) >= 6: # at least 3 points
-            points = polygon_np.reshape(-1,2)
+    # always do CPU→numpy
+    device = 'cpu'
+    if isinstance(polygon, torch.Tensor):
+        polygon_np = polygon.detach().cpu().numpy()
+    else:
+        polygon_np = np.array(polygon)
 
-            # Calculate the SAME scale factor used in _resize_preserve_aspect
-            scale = min(output_w / orig_w, output_h / orig_h)
-            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+    # must be an even number of coords, at least 3 points
+    if len(polygon_np) % 2 == 0 and len(polygon_np) >= 6:
+        pts = polygon_np.reshape(-1, 2)
 
-            # Calculate the padding offset (match _resize_preserve_aspect logic)
-            x_offset = (output_w - new_w) // 2
-            y_offset = (output_h - new_h) // 2
+        # reproduce your _resize_preserve_aspect scaling
+        scale = min(output_w / orig_w, output_h / orig_h)
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        x_off = (output_w - new_w) // 2
+        y_off = (output_h - new_h) // 2
 
-            # Scale point first
-            scaled_points = points.copy()
-            scaled_points[:, 0] *= scale
-            scaled_points[:, 1] *= scale
+        scaled = pts.copy()
+        scaled[:, 0] *= scale
+        scaled[:, 1] *= scale
+        scaled[:, 0] += x_off
+        scaled[:, 1] += y_off
 
-            # Then add the offset for the padding
-            scaled_points[:, 0] += x_offset
-            scaled_points[:, 1] += y_offset
+        pts_i = scaled.astype(np.int32)
+        mask = np.zeros((output_h, output_w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts_i], 1)
 
-            # Convert to integers for OpenCV
-            points_int = scaled_points.astype(np.int32)
+        mask_t = torch.from_numpy(mask).float().to(device)
+        return mask_t
 
-            # Create binary mask using OpenCV
-            mask = np.zeros((output_h, output_w), dtype=np.uint8)
-            cv2.fillPoly(mask, [points_int], 1)
+    # fallback for malformed
+    return torch.zeros((output_h, output_w), dtype=torch.float32, device=device)
 
-            # Convert to tensor
-            mask_tensor = torch.from_numpy(mask).float().to(device)
 
-            # Free numpy memory
-            del mask, points_int, scaled_points, points, polygon_np
+def segments_to_masks(
+    segments: List[List[List[float]]],
+    classes:  List[List[int]],
+    output_size:     Tuple[int,int],
+    original_size:   List[Tuple[int,int]],
+    num_classes:     int
+) -> torch.Tensor:
+    """
+    Batch‐level mask builder.  Mirrors your old
+    BrainSegmentationLoss._segments_to_masks, including
+    hole‐punching and mutual‐exclusivity.
+    Returns: Tensor of shape [B, num_classes, H, W].
+    """
+    batch_size = len(segments)
+    H, W = output_size
+    masks = torch.zeros((batch_size, num_classes, H, W), dtype=torch.float32)
 
-            return mask_tensor
-        else:
-            # Invalid polygon return empty mask
-            return torch.zeros((output_h, output_w), dtype=torch.float32, device=device)
+    for b in range(batch_size):
+        segs   = segments[b]
+        clses  = classes[b]
+        orig   = original_size[b]  # (h, w)
+
+        # 1) group polygons by class
+        by_cls: Dict[int, List[List[float]]] = {}
+        for seg, cls in zip(segs, clses):
+            if cls < num_classes:
+                by_cls.setdefault(cls, []).append(seg)
+
+        # 2) rasterize + hole-punch per class
+        sample_mask = torch.zeros((num_classes, H, W), dtype=torch.float32)
+        for cls, polys in by_cls.items():
+            pmasks = [rasterize_polygon(p, output_size, orig) for p in polys]
+            if len(pmasks) == 1:
+                cm = pmasks[0]
+            else:
+                # sort by area desc, fill outer, punch out inner
+                areas = [m.sum().item() for m in pmasks]
+                order = sorted(range(len(areas)), key=lambda i: areas[i], reverse=True)
+                cm = pmasks[order[0]].clone()
+                for i in order[1:]:
+                    hole = pmasks[i].bool()
+                    cm[hole] = 0.0
+            sample_mask[cls] = cm
+            for m in pmasks: del m
+
+        # 3) mutual-exclusivity: if >1 class touched a pixel,
+        #    keep only the class with highest priority (lowest class index)
+        total = sample_mask.sum(dim=0)  # [H,W] - sum across classes
+        overlap_mask = total > 1        # [H,W] - pixels with multiple classes
+
+        if overlap_mask.any():
+            # For overlapping pixels, keep only the class with lowest index (highest priority)
+            for c in range(num_classes):
+                class_mask = sample_mask[c]  # [H,W]
+                if class_mask.any():
+                    # For this class, zero out pixels that overlap with higher-priority classes (lower indices)
+                    for higher_priority_c in range(c):
+                        if sample_mask[higher_priority_c].any():
+                            # Remove pixels where higher priority class is present
+                            conflict_pixels = (sample_mask[higher_priority_c] > 0) & (class_mask > 0)
+                            sample_mask[c][conflict_pixels] = 0.0
+
+        masks[b] = sample_mask
+
+    return masks
