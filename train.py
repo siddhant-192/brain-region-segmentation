@@ -1,7 +1,7 @@
 ########## train.py ##########
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 import time
 import argparse
 import numpy as np
@@ -1030,54 +1030,67 @@ def main():
             print(f"Loading checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             start_epoch = checkpoint.get('epoch', 0)
-            # Handle potential 'module.' prefix mismatches when loading weights
-            if args.resume:
-                if os.path.isfile(args.resume):
-                    print(f"Loading checkpoint: {args.resume}")
-                    checkpoint = torch.load(args.resume, map_location=device)
-                    start_epoch = checkpoint.get('epoch', 0)
-                    
-                    # Create a new state dict without prefix issues
-                    state_dict = checkpoint['model_state_dict']
-                    new_state_dict = {}
-                    
-                    for k, v in state_dict.items():
-                        # Handle both cases: adding or removing 'module.' prefix
-                        if k.startswith('module.') and not any(k.startswith('module.module.') for k in state_dict):
-                            # If we're loading a non-DDP model with a DDP model
-                            if isinstance(model, DDP):
-                                new_state_dict[k] = v
-                            else:
-                                new_state_dict[k[7:]] = v  # Remove 'module.' prefix
-                        else:
-                            # If we're loading a DDP model with a non-DDP model
-                            if isinstance(model, DDP) and not k.startswith('module.'):
-                                new_state_dict[f'module.{k}'] = v
-                            else:
-                                new_state_dict[k] = v
-                    
-                    # Load with strict=False to ignore missing/unexpected keys
-                    model.load_state_dict(new_state_dict, strict=False)
-                    
-                    # Continue with the rest of your loading code
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    if 'scheduler_state_dict' in checkpoint:
-                        lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                    if 'ema' in checkpoint and ema is not None:
-                        ema.load_state_dict(checkpoint['ema'])
-                    best_dice = checkpoint.get('best_dice', 0.0)
-                    best_iou = checkpoint.get('best_iou', 0.0)
-                    print(f"Loaded checkpoint from epoch {start_epoch}")
+            
+            # Create a new state dict without prefix issues
+            state_dict = checkpoint['model_state_dict']
+            new_state_dict = {}
+            
+            for k, v in state_dict.items():
+                # Handle both cases: adding or removing 'module.' prefix
+                if k.startswith('module.') and not any(k.startswith('module.module.') for k in state_dict):
+                    # If we're loading a non-DDP model with a DDP model
+                    if isinstance(model, DDP):
+                        new_state_dict[k] = v
+                    else:
+                        new_state_dict[k[7:]] = v  # Remove 'module.' prefix
                 else:
-                    print(f"No checkpoint found at {args.resume}")
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    # If we're loading a DDP model with a non-DDP model
+                    if isinstance(model, DDP) and not k.startswith('module.'):
+                        new_state_dict[f'module.{k}'] = v
+                    else:
+                        new_state_dict[k] = v
+            
+            # Load model state with strict=False to ignore missing/unexpected keys
+            model.load_state_dict(new_state_dict, strict=False)
+            
+            # CRITICAL FIX: Update fusion trainer and optimizer BEFORE loading optimizer state
+            # This ensures the optimizer has the correct structure for the current epoch
+            if start_epoch >= fusion_trainer.freeze_epochs:
+                print(f"Checkpoint from epoch {start_epoch} - updating fusion trainer state")
+                # Force update the fusion trainer to the correct epoch state
+                optimizer = fusion_trainer.update(start_epoch - 1)  # Update to the state it should be in
+            
+            # Now try to load optimizer state - with error handling for parameter group mismatch
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Successfully loaded optimizer state")
+            except ValueError as e:
+                if "different number of parameter groups" in str(e):
+                    print(f"Warning: Optimizer parameter group mismatch - {str(e)}")
+                    print("Skipping optimizer state loading. Training will continue with fresh optimizer state.")
+                    print("This is normal when resuming across fusion weight training phase transitions.")
+                else:
+                    raise e
+            
+            # Load scheduler state
             if 'scheduler_state_dict' in checkpoint:
-                lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                try:
+                    lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print("Successfully loaded scheduler state")
+                except Exception as e:
+                    print(f"Warning: Could not load scheduler state: {e}. Using fresh scheduler.")
+            
+            # Load EMA state
             if 'ema' in checkpoint and ema is not None:
-                ema.load_state_dict(checkpoint['ema'])
+                try:
+                    ema.load_state_dict(checkpoint['ema'])
+                    print("Successfully loaded EMA state")
+                except Exception as e:
+                    print(f"Warning: Could not load EMA state: {e}. Using fresh EMA.")
+            
             best_dice = checkpoint.get('best_dice', 0.0)
             best_iou = checkpoint.get('best_iou', 0.0)
-            print(f"Loaded checkpoint from epoch {start_epoch}")
+            print(f"Loaded checkpoint from epoch {start_epoch}, best_dice: {best_dice:.4f}, best_iou: {best_iou:.4f}")
         else:
             print(f"No checkpoint found at {args.resume}")
     
