@@ -121,7 +121,7 @@ class BrainSegmentationDataset(Dataset):
         label_filename = img_filename.replace(".jpg", ".txt")
         label_path = os.path.join(self.labels_dir, label_filename)
 
-        segments, classes = self._parse_yolo_labels(label_path, original_w, original_h, scale, x_offset, y_offset)
+        segments, classes = self._parse_yolo_labels(label_path, original_w, original_h)
 
         # Apply any transformation
         if self.transform:
@@ -161,7 +161,7 @@ class BrainSegmentationDataset(Dataset):
 
         return square, scale, x_offset, y_offset
 
-    def _parse_yolo_labels(self, label_path, orig_w, orig_h, scale, x_offset, y_offset):
+    def _parse_yolo_labels(self, label_path, orig_w, orig_h):
         """
         Parse YOLO format labels and apply the same transformations as the image
         """
@@ -180,12 +180,8 @@ class BrainSegmentationDataset(Dataset):
                         x_abs = coords[i] * orig_w
                         y_abs = coords[i+1] * orig_h
                         
-                        # Apply the same transformation as the image
-                        x_transformed = x_abs * scale + x_offset
-                        y_transformed = y_abs * scale + y_offset
-                        
-                        abs_coords.append(x_transformed)
-                        abs_coords.append(y_transformed)
+                        abs_coords.append(x_abs)
+                        abs_coords.append(y_abs)
                     
                     segments.append(abs_coords)
                     classes.append(cls)
@@ -195,7 +191,7 @@ class BrainSegmentationDataset(Dataset):
 class LightweightDecoder(nn.Module):
     """
     Lightweight decoder with skip connections.
-    Converts 32 feature channels to 25 class channels with spatial unsampling.
+    Converts 32 feature channels to 25 class channels with spatial upsampling.
     """
     def __init__(self, in_channels=32, num_classes=25):
         super().__init__()
@@ -1018,22 +1014,21 @@ def segments_to_masks(
     for b in range(batch_size):
         segs   = segments[b]
         clses  = classes[b]
-        orig   = original_size[b]  # (h, w)
+        orig   = original_size[b]
 
-        # 1) group polygons by class
+        # 1) group polygons by class (same as before)
         by_cls: Dict[int, List[List[float]]] = {}
         for seg, cls in zip(segs, clses):
             if cls < num_classes:
                 by_cls.setdefault(cls, []).append(seg)
 
-        # 2) rasterize + hole-punch per class
+        # 2) rasterize + hole-punch per class (same as before)
         sample_mask = torch.zeros((num_classes, H, W), dtype=torch.float32)
         for cls, polys in by_cls.items():
             pmasks = [rasterize_polygon(p, output_size, orig) for p in polys]
             if len(pmasks) == 1:
                 cm = pmasks[0]
             else:
-                # sort by area desc, fill outer, punch out inner
                 areas = [m.sum().item() for m in pmasks]
                 order = sorted(range(len(areas)), key=lambda i: areas[i], reverse=True)
                 cm = pmasks[order[0]].clone()
@@ -1043,22 +1038,28 @@ def segments_to_masks(
             sample_mask[cls] = cm
             for m in pmasks: del m
 
-        # 3) mutual-exclusivity: if >1 class touched a pixel,
-        #    keep only the class with highest priority (lowest class index)
-        total = sample_mask.sum(dim=0)  # [H,W] - sum across classes
-        overlap_mask = total > 1        # [H,W] - pixels with multiple classes
-
+        # 3) FIXED: Softer mutual exclusivity for brain segmentation
+        total = sample_mask.sum(dim=0)  # [H,W]
+        overlap_mask = total > 1.5  # Only resolve significant overlaps
+        
         if overlap_mask.any():
-            # For overlapping pixels, keep only the class with lowest index (highest priority)
-            for c in range(num_classes):
-                class_mask = sample_mask[c]  # [H,W]
-                if class_mask.any():
-                    # For this class, zero out pixels that overlap with higher-priority classes (lower indices)
-                    for higher_priority_c in range(c):
-                        if sample_mask[higher_priority_c].any():
-                            # Remove pixels where higher priority class is present
-                            conflict_pixels = (sample_mask[higher_priority_c] > 0) & (class_mask > 0)
-                            sample_mask[c][conflict_pixels] = 0.0
+            # For overlapping pixels, use weighted combination instead of elimination
+            for h in range(H):
+                for w in range(W):
+                    if overlap_mask[h, w]:
+                        # Find overlapping classes at this pixel
+                        overlapping_classes = []
+                        for c in range(num_classes):
+                            if sample_mask[c, h, w] > 0:
+                                overlapping_classes.append(c)
+                        
+                        if len(overlapping_classes) > 1:
+                            # Keep the class with highest priority (lowest index)
+                            # but reduce intensity instead of eliminating
+                            keep_class = min(overlapping_classes)
+                            for c in overlapping_classes:
+                                if c != keep_class:
+                                    sample_mask[c, h, w] *= 0.3  # Reduce instead of eliminate
 
         masks[b] = sample_mask
 

@@ -73,6 +73,53 @@ def ddp_setup():
     print(f"[DDP] rank {rank}/{world_size} on GPU {local_rank}, NCCL timeout extended")
     return rank, world_size
 
+def debug_mask_statistics(gt_masks, class_names, epoch, batch_idx, detailed=False):
+    """
+    Debug function to check mask statistics and identify missing classes
+    
+    Args:
+        gt_masks: Ground truth masks tensor (B, C, H, W)
+        class_names: Dictionary mapping class indices to names  
+        epoch: Current epoch number
+        batch_idx: Current batch index
+        detailed: Whether to show detailed per-batch statistics
+    """
+    B, C, H, W = gt_masks.shape
+    
+    if detailed:
+        print(f"\n=== Mask Statistics [Epoch {epoch}, Batch {batch_idx}] ===")
+    
+    total_classes_with_pixels = 0
+    total_overlap_pixels = 0
+    total_active_pixels = 0
+    
+    for c in range(C):
+        class_pixels = (gt_masks[:, c] > 0).sum().item()
+        if class_pixels > 0:
+            total_classes_with_pixels += 1
+            if detailed:
+                class_name = class_names.get(c, f'Unknown_{c}')
+                print(f"  Class {c:2d} ({class_name:<20}): {class_pixels:,} pixels")
+        elif detailed:
+            class_name = class_names.get(c, f'Unknown_{c}')
+            print(f"  Class {c:2d} ({class_name:<20}): 0 pixels ❌")
+    
+    # Check overlap statistics
+    total_active = (gt_masks.sum(dim=1) > 0).sum().item()
+    overlap_pixels = (gt_masks.sum(dim=1) > 1).sum().item()
+    
+    if detailed:
+        print(f"  Total active pixels: {total_active:,}")
+        print(f"  Overlapping pixels: {overlap_pixels:,} ({overlap_pixels/max(total_active,1)*100:.1f}%)")
+        print(f"  Classes with pixels: {total_classes_with_pixels}/{C}")
+    
+    return {
+        'classes_with_pixels': total_classes_with_pixels,
+        'total_classes': C,
+        'overlap_pixels': overlap_pixels,
+        'active_pixels': total_active
+    }
+
 # Setup data augmentation
 def get_transforms(is_train=True):
     """
@@ -542,6 +589,18 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
                     target_sizes
                 ).to(device)  # Move gt_masks to GPU if not already
 
+                # Debug mask statistics for first few batches
+                if batch_idx <= 2:  # Only for first 3 batches to avoid spam
+                    mask_stats = debug_mask_statistics(
+                        gt_masks.cpu(), 
+                        idx_to_class, 
+                        epoch, 
+                        batch_idx, 
+                        detailed=True
+                    )
+                    if batch_idx == 0:  # Print summary for first batch
+                        print(f"🔍 [DEBUG] Epoch {epoch}: {mask_stats['classes_with_pixels']}/{mask_stats['total_classes']} classes have pixels")
+
                 # After generating gt_masks in validation
                 if batch_idx % visualize_every == 0 and batch_idx < max_visualizations * visualize_every:
                     for i in range(min(images.size(0), 3)):
@@ -658,6 +717,21 @@ def validate(model, val_loader, criterion, device, epoch, output_dir, idx_to_cla
     
     # Final cache clear
     torch.cuda.empty_cache()
+
+    # Print summary of mask statistics for this epoch
+    if batch_count > 0:
+        print(f"\n📊 [Epoch {epoch} Summary] Validation completed with {batch_count} batches")
+        print(f"   Average Dice: {avg_dice:.4f}, Average IoU: {avg_iou:.4f}")
+        if avg_class_dice:
+            non_zero_classes = sum(1 for score in avg_class_dice.values() if score > 0)
+            print(f"   Classes with non-zero Dice: {non_zero_classes}/{len(idx_to_class)}")
+            
+            # Show top 5 and bottom 5 performing classes
+            sorted_classes = sorted(avg_class_dice.items(), key=lambda x: x[1], reverse=True)
+            print(f"   Top 5 classes: {[(idx_to_class.get(c, f'C{c}'), f'{s:.3f}') for c, s in sorted_classes[:5]]}")
+            bottom_classes = [c for c, s in sorted_classes if s == 0.0]
+            if bottom_classes:
+                print(f"   ❌ Zero Dice classes: {[idx_to_class.get(c, f'C{c}') for c in bottom_classes[:10]]}")
     
     # Handle case where no batches were successfully processed
     if batch_count == 0:
