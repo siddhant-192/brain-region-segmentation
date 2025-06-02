@@ -97,7 +97,7 @@ class BrainSegmentationDataset(Dataset):
         Get the number of images (datapoints) present in the dataset
         """
         return len(self.image_filenames)
-
+    
     def __getitem__(self, index):
         """
         Get a single whole image and its label.
@@ -111,13 +111,17 @@ class BrainSegmentationDataset(Dataset):
 
         # Resize to target size while preserving aspect ratio
         if (original_h, original_w) != (self.img_size, self.img_size):
-            img = self._resize_preserve_aspect(img, self.img_size)
+            img, scale, x_offset, y_offset = self._resize_preserve_aspect(img, self.img_size)
+        else:
+            scale = 1.0
+            x_offset = 0
+            y_offset = 0
         
         # Parse YOLO format labels
         label_filename = img_filename.replace(".jpg", ".txt")
         label_path = os.path.join(self.labels_dir, label_filename)
 
-        segments, classes = self._parse_yolo_labels(label_path, original_w, original_h)
+        segments, classes = self._parse_yolo_labels(label_path, original_w, original_h, scale, x_offset, y_offset)
 
         # Apply any transformation
         if self.transform:
@@ -134,10 +138,11 @@ class BrainSegmentationDataset(Dataset):
         }
 
         return img_tensor, target
-    
+
     def _resize_preserve_aspect(self, img, target_size):
         """
         Resize the image preserving ratio with padding.
+        Returns: resized_image, scale, x_offset, y_offset
         """
         h, w = img.shape[:2]
         scale = min(target_size / w, target_size / h)
@@ -154,11 +159,11 @@ class BrainSegmentationDataset(Dataset):
 
         square[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
 
-        return square
-    
-    def _parse_yolo_labels(self, label_path, orig_w, orig_h):
+        return square, scale, x_offset, y_offset
+
+    def _parse_yolo_labels(self, label_path, orig_w, orig_h, scale, x_offset, y_offset):
         """
-        Parse YOLO format labels
+        Parse YOLO format labels and apply the same transformations as the image
         """
         segments, classes = [], []
 
@@ -169,16 +174,95 @@ class BrainSegmentationDataset(Dataset):
                     cls = int(parts[0])
                     coords = list(map(float, parts[1:]))
 
-                    # Convert to absolute coordinates
+                    # Convert normalized coordinates to absolute coordinates in original image space
                     abs_coords = []
                     for i in range(0, len(coords), 2):
-                        abs_coords.append(coords[i] * orig_w)
-                        abs_coords.append(coords[i+1] * orig_h)
+                        x_abs = coords[i] * orig_w
+                        y_abs = coords[i+1] * orig_h
+                        
+                        # Apply the same transformation as the image
+                        x_transformed = x_abs * scale + x_offset
+                        y_transformed = y_abs * scale + y_offset
+                        
+                        abs_coords.append(x_transformed)
+                        abs_coords.append(y_transformed)
                     
                     segments.append(abs_coords)
                     classes.append(cls)
         
         return segments, classes
+
+class LightweightDecoder(nn.Module):
+    """
+    Lightweight decoder with skip connections.
+    Converts 32 feature channels to 25 class channels with spatial unsampling.
+    """
+    def __init__(self, in_channels=32, num_classes=25):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # Simple but effective decoder
+        self.decoder_blocks = nn.ModuleList([
+            # Block 1: 32 -> 16 channels, 2x upsampling
+            nn.Sequential(
+                nn.Conv2d(in_channels, 16, 3, padding=1, bias=False),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.Upsample(
+                    scale_factor=2, 
+                    mode='bilinear', 
+                    align_corners=False
+                    )
+            ),
+            # Block 2: 16 -> 8 channels, 2x upsampling
+            nn.Sequential(
+                nn.Conv2d(16, 8, 3, padding=1, bias=False),
+                nn.BatchNorm2d(8),
+                nn.ReLU(inplace=True),
+                nn.Upsample(
+                    scale_factor=2,
+                    mode='bilinear',
+                    align_corners=False
+                )
+            )
+        ])
+
+        # Final classification layer
+        self.final_conv = nn.Conv2d(8, num_classes, kernel_size=1, bias=True)
+
+        # Skip connection projections for input features
+        self.input_skip_proj = nn.Conv2d(3, 8, kernel_size=1, bias=False)
+        nn.init.xavier_normal_(self.input_skip_proj.weight, gain=0.1)
+    
+    def forward(self, features, original_input=None):
+        """
+        Args:
+            features: (B, 32, H, W) - feature maps from fusion
+            original_input: (B, 3, H, W) - original RGB input for skip connection
+        """
+        x = features
+
+        # Apply decoding blocks
+        for decoder_block in self.decoder_blocks:
+            x = decoder_block(x) # Progressive upsample and feature refinement
+
+        # Skip connection from original input
+        if original_input is not None:
+            # Resize original input to match current spatial size
+            skip_input = F.interpolate(
+                original_input,
+                size=x.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            # Project to matching channels and add
+            skip_features = self.input_skip_proj(skip_input)
+            x = x + 0.2 * skip_features # SKIP CONNECTION
+        
+        # Final classification
+        output = self.final_conv(x)
+        
+        return output
 
 class PatchFusionYOLO(nn.Module):
     def __init__(self, base_model, num_classes=25, learn_fusion_weights=True, freeze_base=True):
@@ -201,11 +285,12 @@ class PatchFusionYOLO(nn.Module):
         self.overlap_percent = 10
         self.central_patch_overlap = 5
 
-        self.class_conv = nn.Conv2d(
-            in_channels=32, # prototype depth from YOLO-seg
-            out_channels=self.num_classes,
-            kernel_size=1,
-            bias=True
+        # Expected output channels from YOLO backbone
+        self.expected_channels = 32
+
+        self.decoder = LightweightDecoder(
+            in_channels=self.expected_channels, #32
+            num_classes=self.num_classes        #25
         )
 
         # Initialize learnable fusion weights with better defaults and constraints
@@ -229,9 +314,15 @@ class PatchFusionYOLO(nn.Module):
 
         # Channel projection layers (lazily initialized when needed)
         self.channel_projections = nn.ModuleDict()
-        
-        # Expected output channels from YOLO backbone
-        self.expected_channels = 32
+
+        # Feature channel attention (operates on 32 feature channels)
+        self.feature_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(self.expected_channels, self.expected_channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.expected_channels // 4, self.expected_channels, 1),
+            nn.Sigmoid()
+        )
     
     def _freeze_base_model(self):
         """
@@ -294,6 +385,9 @@ class PatchFusionYOLO(nn.Module):
         """
         batch_size, channels, input_height, input_width = x.shape
 
+        # Store original input for skip connections
+        original_input = x
+
         # If batch size is >1 then process each image seperately
         if batch_size>1:
             outputs = []
@@ -312,25 +406,13 @@ class PatchFusionYOLO(nn.Module):
                 align_corners=False
             )
         
-        result = self.class_conv(result)
+        # Ensure proper channel count (32 feature channels)
+        result = self._ensure_channel_count(result)
 
-        # Add skip connection from input image
-        if not hasattr(self, 'input_projection'):
-            # Create projecttion for input on first use
-            self.input_projection = nn.Conv2d(
-                in_channels=channels,
-                out_channels=self.num_classes,
-                kernel_size=1,
-                bias=False
-            ).to(x.device)
-            # Initialize with small weights
-            nn.init.xavier_normal_(self.input_projection.weight, gain=0.01)
-        
-        # Create skip connection with small weight
-        skip_connection = self.input_projection(x)
-        result = result + 0.05 * skip_connection
+        # Use decoder to get the final output
+        final_output = self.decoder(result, original_input)
 
-        return result
+        return final_output
     
     @staticmethod
     def _pad_to_stride(x, stride):
@@ -656,39 +738,53 @@ class PatchFusionYOLO(nn.Module):
 
     def _fuse_multi_resolution(self, fusion_map_2048, fusion_map_4096):
         """
-        Fuse results for different resolutions with learnable weights
+        Enhanced multi-resolution fusion with skip connections for FEATURE channels.
         """
-        # Resize 2048 map to match 4096
+        # Resize the 2048 map to match 2096
         resized_fusion_map_2048 = F.interpolate(
             fusion_map_2048,
             size=fusion_map_4096.shape[2:],
             mode='bilinear',
             align_corners=False
         )
-        
-        # Initialize fused map
+
+        # SKIP CONNECTION 1: Global feature-level residual connection
+        # This preserces information across all feature channels
+        global_residual = fusion_map_4096 + 0.3 * resized_fusion_map_2048
+
+        # Initialize the fusion map
         fused_map = torch.zeros_like(fusion_map_4096)
 
-        # Apply sigmoid to resolution weight for stability
+        # Apply learnable weights
         if self.learn_fusion_weights:
             resolution_weight = torch.sigmoid(self.resolution_weight_logit)
         else:
             resolution_weight = self.resolution_weight
+        
+        # Process each FEATURE channel (not class channel)
+        for feature_idx in range(fusion_map_4096.shape[1]):
+            # Extract feature maps
+            map_4096 = fusion_map_4096[:, feature_idx:feature_idx+1]
+            map_2048 = resized_fusion_map_2048[:, feature_idx:feature_idx+1]
 
-        # Process each class channel
-        for class_idx in range(fusion_map_4096.shape[1]):
-            # Extarct class maps
-            map_4096 = fusion_map_4096[:, class_idx:class_idx+1]
-            map_2048 = resized_fusion_map_2048[:, class_idx:class_idx+1]
+            # Get corresponding global residuals
+            residual_features = global_residual[:, feature_idx:feature_idx+1]
 
-            # Create soft boundary mask based on 2048 map
+            # Create soft boundary mask based on the 2048 map
             mask_2048 = torch.sigmoid((map_2048 - self.boundary_weight) * 10.0)
 
             # Weighted combination using learnable parameter
-            fused_map[:, class_idx:class_idx+1] = (
+            base_fusion = (
                 map_4096 * resolution_weight +
                 map_2048 * (1 - resolution_weight)
             ) * mask_2048
+
+            # SKIP CONNECTION 2: Add feature-level residual
+            fused_map[:, feature_idx:feature_idx+1] = base_fusion + 0.2 * residual_features
+        
+        if hasattr(self, 'feature_attention'):
+            attention_weights = self.feature_attention(fused_map)
+            fused_map = fused_map * attention_weights
         
         return fused_map
     
@@ -849,7 +945,6 @@ class BrainSegmentationLoss(nn.Module):
             output_size, original_size,
             num_classes=self.num_classes
         )
-
     
 def rasterize_polygon(
     polygon: Union[List[float], torch.Tensor],
@@ -857,8 +952,9 @@ def rasterize_polygon(
     original_size: Tuple[int,int],
 ) -> torch.Tensor:
     """
-    Exactly your old BrainSegmentationLoss._rasterize_polygon,
-    but as a free function.
+    Rasterizes a polygon (given as a list or tensor of coordinates) onto a 2D torch 
+    tensor mask of specified output size, preserving the aspect ratio relative to 
+    the original image size.
     """
     output_h, output_w = output_size
     orig_h, orig_w   = original_size
@@ -903,7 +999,6 @@ def rasterize_polygon(
     # fallback for malformed
     return torch.zeros((output_h, output_w), dtype=torch.float32, device=device)
 
-
 def segments_to_masks(
     segments: List[List[List[float]]],
     classes:  List[List[int]],
@@ -912,8 +1007,7 @@ def segments_to_masks(
     num_classes:     int
 ) -> torch.Tensor:
     """
-    Batch‐level mask builder.  Mirrors your old
-    BrainSegmentationLoss._segments_to_masks, including
+    Batch‐level mask builder, including
     hole‐punching and mutual‐exclusivity.
     Returns: Tensor of shape [B, num_classes, H, W].
     """

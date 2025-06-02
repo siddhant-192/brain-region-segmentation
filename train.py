@@ -945,7 +945,7 @@ def main():
         collate_fn=brain_segmentation_collate_fn,
     )
 
-    print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
+    print(f"t size: Train dataset size: {len(train_dataset)}, Validation datase{len(val_dataset)}")
 
     # Initialize mixed precision scaler if requested
     scaler = GradScaler() if args.mixed_precision else None
